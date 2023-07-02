@@ -28,25 +28,21 @@ class Mask(Module):
 class Attn(Module):
     def __init__(self, d_in, d_out, d_k, d_v, n_heads, mask="causal"):
         super().__init__()
-        self.d_in = d_in
-        self.d_out = d_out
         self.d_k = d_k
         self.d_v = d_v
         self.n_heads = n_heads
         
         self.mask = Mask(mask=mask)
         self.softmax = torch.nn.Softmax(dim=-1)
-
         self.query_proj = Linear(d_in, d_k*n_heads, bias=True)
         self.key_proj = Linear(d_in, d_k*n_heads, bias=True)
         self.value_proj = Linear(d_in, d_v*n_heads, bias=True)
         self.linear = Linear(d_v*n_heads, d_out, bias=True)
 
     def forward(self, x):
-        (n_ctx, d_model) = x.shape[-2:]
-        assert d_model == self.d_in, f"{d_model} != {self.d_in}"
-        split_heads = lambda x: x.view(x.shape[:-1]+(self.n_heads,-1)).transpose(-2,-3).contiguous()
-        merge_heads = lambda x: x.transpose(-2,-3).contiguous().view(x.shape[:-3]+(n_ctx,self.d_v*self.n_heads))
+        n_ctx = x.shape[-2]
+        split_heads = lambda x: x.view(x.shape[:-1]+(self.n_heads,self.d_k)).transpose(-2,-3).contiguous()
+        merge_heads = lambda x: x.transpose(-2,-3).contiguous().view(x.shape[:-3]+(n_ctx,self.n_heads*self.d_v))
         (Q, K, V) = map(split_heads,(self.query_proj(x),self.key_proj(x),self.value_proj(x)))
         QKT = torch.matmul(Q/math.sqrt(self.d_k),K.transpose(-1,-2))
         return self.linear(merge_heads(self.softmax(self.mask(QKT))@V))
@@ -55,11 +51,6 @@ class Attn(Module):
 class TransformerLayer(Module):
     def __init__(self, d_model, d_k, d_v, n_heads, d_hidden):
         super().__init__()
-        self.d_model = d_model
-        self.d_hidden = d_hidden
-        self.d_k = d_k
-        self.d_v = d_v
-        self.n_heads = n_heads
         self.attn = Attn(d_model, d_model, d_k, d_v, n_heads, 'causal')
         self.ln1 = LayerNorm(d_model)
         self.ff1 = Linear(d_model, d_hidden)
@@ -73,8 +64,6 @@ class TransformerLayer(Module):
 
 class Transformer(Module):
     def __init__(self,
-                 n_vocab_in=256,
-                 n_vocab_out=256,
                  d_model=1024,
                  d_k=64,
                  d_v=64,
@@ -82,17 +71,7 @@ class Transformer(Module):
                  d_hidden=4096,
                  n_layers=16):
         super().__init__()
-        self.n_vocab_in = n_vocab_in
-        self.n_vocab_out = n_vocab_out
-        self.d_model = d_model
-        self.d_k = d_k
-        self.d_v = d_v
-        self.n_heads = n_heads
-        self.d_hidden = d_hidden
-        self.n_layers = n_layers
-
         self.layers = ModuleList(TransformerLayer(d_model, d_k, d_v, n_heads, d_hidden) for _ in range(n_layers))
-
 
     def forward(self, x):
         xs = [x]
@@ -102,39 +81,9 @@ class Transformer(Module):
         return torch.stack(xs, dim=0)
 
 
-    def get_config(self):
-        return {
-            'n_vocab_in': self.n_vocab_in,
-            'n_vocab_out': self.n_vocab_out,
-            'd_model': self.d_model,
-            'd_k': self.d_k,
-            'd_v': self.d_v,
-            'n_heads': self.n_heads,
-            'n_layers': self.n_layers
-        }  
-
-
-    def save(self, path):
-        torch.save({
-            'state_dict': self.state_dict(),
-            'config': self.get_config()
-        }, f=path)
-
-    @staticmethod
-    def load(path):
-        checkpoint = torch.load(path)
-        config = checkpoint['config']
-        sd = checkpoint['state_dict']
-        module = Transformer(**config)
-        module.load_state_dict(sd)
-        return module
-
-
 class TextInput(Module):
     def __init__(self, n_vocab_in, d_model):
         super().__init__()
-        self.n_vocab_in = n_vocab_in
-        self.d_model = d_model
         self.linear = Linear(d_model, d_model, bias=False)
         self.linear.weight.data *= 0.0
         self.embedding = Embedding(n_vocab_in, d_model)
@@ -156,8 +105,6 @@ class TextInput(Module):
 class TextOutput(Module):
     def __init__(self, n_vocab_out, d_model):
         super().__init__()
-        self.n_vocab_out = n_vocab_out
-        self.d_model = d_model
         self.linear = Linear(d_model, n_vocab_out)
 
     def forward(self, x):
@@ -177,16 +124,7 @@ class LanguageModel(Module):
                  bos=0):
   
         super().__init__()
-        self.n_vocab_in = n_vocab_in
-        self.n_vocab_out = n_vocab_out
-        self.d_model = d_model
-        self.d_k = d_k
-        self.d_v = d_v
-        self.n_heads = n_heads
-        self.d_hidden = d_hidden
-        self.n_layers = n_layers
-        self.bos = bos  # beginning of sequence token
-        self.text_input = TextInput(n_vocab_in=n_vocab_in, d_model=d_model)
+        self.text_input = TextInput(n_vocab_in=n_vocab_in, d_model=d_model, bos=bos)
         self.module = Transformer(n_vocab_in=n_vocab_in,
                                   n_vocab_out=n_vocab_out,
                                   d_model=d_model,
@@ -217,11 +155,21 @@ class LanguageModel(Module):
 
 class Trainer:
     def __init__(self,
-                 model=None,
                  example_length=512,
                  batch_size=1,
-                 batch_multiplier=8,
-                 lr=1e-6):
+                 n_vocab_in=256,
+                 n_vocab_out=256,
+                 d_model=1024,
+                 d_k=64,
+                 d_v=64,
+                 n_heads=16,
+                 d_hidden=4096,
+                 n_layers=16,
+                 bos=0,
+                 lr=1e-6,
+                 betas=(.9, .999),
+                 weight_decay=0.001,
+                 batch_multiplier=8):
         """
         example_length: length of examples to use for training
         batch_size: number of examples in a single batch
@@ -230,42 +178,74 @@ class Trainer:
                           an effective batch_size of batch_size*batch_multiplier,
                           hence the name.
         """
-        self.example_length = example_length
-        self.batch_size = batch_size
-        self.batch_multiplier = batch_multiplier
-        self.dataset = FastPileBytesDataset(example_length=512)
-        self.model = model if model is not None else LanguageModel().to('cuda')
+        self.config = {
+            'example_length': example_length,
+            'batch_size': batch_size,
+            'n_vocab_in': n_vocab_in,
+            'n_vocab_out': n_vocab_out,
+            'd_model': d_model,
+            'd_k': d_k,
+            'd_v': d_v,
+            'n_heads': n_heads,
+            'd_hidden': d_hidden,
+            'n_layers': n_layers,
+            'bos': bos,
+            'lr': lr,
+            'betas': betas,
+            'weight_decay': weight_decay,
+            'batch_multiplier': batch_multiplier
+        }
 
+        self.dataset = FastPileBytesDataset(example_length=512)
+        self.model = LanguageModel(n_vocab_in=n_vocab_in,
+                                   n_vocab_out=n_vocab_out,
+                                   d_model=d_model,
+                                   d_k=d_k,
+                                   d_v=d_v,
+                                   n_heads=n_heads,
+                                   d_hidden=d_hidden,
+                                   n_layers=n_layers,
+                                   bos=bos).to('cuda')
         self.optimizer = CustomAdamW(
             [{'params': self.model.text_input.parameters(), 'lr': 1e-5}] +
             [{'params': self.model.text_output.parameters(), 'lr': 2e-4}] +
             [{'params': layer.parameters(), 'lr': 2e-4} for layer in self.model.module.layers],
-            lr=lr, batch_multiplier=batch_multiplier)
+            lr=lr, betas=betas, weight_decay=weight_decay, batch_multiplier=batch_multiplier)
 
         self.inbox = []
         self.loss_by_layer = []
         self.last_layer_loss = []
         self.times = []
-        self.start_time = time.time()
         self.n = 0
         self.D = 0 # total data
 
     def save(self, path):
-        torch.save({
-            'state_dict': self.state_dict(),
-            'config': self.get_config()
-        }, f=path)
+        checkpoint = {
+            'model_state_dict': self.model.state_dict(),
+            #'optimizer_state_dict': self.optimizer.state_dict(),
+            'config': self.config,
+            'loss_by_layer': self.loss_by_layer,
+            'last_layer_loss': self.last_layer_loss,
+            'time': self.times,
+            'n': self.n,
+            'D': self.D
+        }
+        torch.save(checkpoint, path)
 
-    @staticmethod
-    def load(path):
-        module = Transformer.load(path)
-        module.load_state_dict(sd)
-        return module
+    @classmethod
+    def load(cls, path):
+        checkpoint = torch.load(path)
+        config = checkpoint['config']
+        trainer = cls(**config)  # Make Trainer instance with same arguments
+        trainer.model.load_state_dict(checkpoint['model_state_dict'])
+        #trainer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        trainer.loss_by_layer = checkpoint['loss_by_layer']
+        trainer.last_layer_loss = checkpoint['last_layer_loss']
+        trainer.times = checkpoint['times']
+        trainer.n = checkpoint['n']
+        trainer.D = checkpoint['D']
+        return trainer
 
-    def set_lr(self, lr):
-        for pn in self.optimizer.parameters:
-            self.optimizer.state[pn]['lr'] = lr
-    
     def clear_stats(self):
         self.inbox = []
         self.loss_by_layer = []
@@ -275,11 +255,15 @@ class Trainer:
         self.D = 0 # total data
 
     def train(self):
+        batch_size = self.config['batch_size']
+        example_length = self.config['example_length']
+
         if len(self.inbox) > 0:
             batch = self.inbox.pop()
         else:
-            batch = self.dataset.batch(batch_size=self.batch_size, example_length=self.example_length)
-        self.D += self.batch_size * self.example_length
+            batch = self.dataset.batch(batch_size=batch_size,
+                                       example_length=example_length)
+        self.D += batch_size * example_length
         losses = self.model.losses(batch)
         losses = torch.nan_to_num(losses, nan=0.0, posinf=0.0, neginf=0.0)
         loss = torch.mean(losses)
