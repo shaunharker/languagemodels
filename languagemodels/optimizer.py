@@ -22,7 +22,7 @@ class EMAFilter:
                 slices = [slice(0, dim) for dim in self.x.shape]
                 new_x[slices] = self.x
                 self.x = new_x
-            beta = self.param(self.n)
+            beta = self.param
             self.x.mul_(beta).add_(x, alpha=1-beta)
         self.n += 1
         return self.x

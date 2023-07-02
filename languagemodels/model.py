@@ -82,12 +82,12 @@ class Transformer(Module):
 
 
 class TextInput(Module):
-    def __init__(self, n_vocab_in, d_model):
+    def __init__(self, n_vocab_in, d_model, bos=0):
         super().__init__()
         self.linear = Linear(d_model, d_model, bias=False)
         self.linear.weight.data *= 0.0
         self.embedding = Embedding(n_vocab_in, d_model)
-        self.bos = 0
+        self.bos = bos
 
     def forward(self, input_ids):
         padded_input_ids = pad(input_ids, (1, 0), "constant", self.bos)
@@ -125,9 +125,7 @@ class LanguageModel(Module):
   
         super().__init__()
         self.text_input = TextInput(n_vocab_in=n_vocab_in, d_model=d_model, bos=bos)
-        self.module = Transformer(n_vocab_in=n_vocab_in,
-                                  n_vocab_out=n_vocab_out,
-                                  d_model=d_model,
+        self.module = Transformer(d_model=d_model,
                                   d_k=d_k,
                                   d_v=d_v,
                                   n_heads=n_heads,
@@ -207,9 +205,9 @@ class Trainer:
                                    n_layers=n_layers,
                                    bos=bos).to('cuda')
         self.optimizer = CustomAdamW(
-            [{'params': self.model.text_input.parameters(), 'lr': 1e-5}] +
-            [{'params': self.model.text_output.parameters(), 'lr': 2e-4}] +
-            [{'params': layer.parameters(), 'lr': 2e-4} for layer in self.model.module.layers],
+            [{'params': layer.parameters()} for layer in self.model.module.layers] +
+            [{'params': self.model.text_input.parameters()}] +
+            [{'params': self.model.text_output.parameters()}],
             lr=lr, betas=betas, weight_decay=weight_decay, batch_multiplier=batch_multiplier)
 
         self.inbox = []
@@ -219,6 +217,11 @@ class Trainer:
         self.n = 0
         self.D = 0 # total data
 
+    def update_lr(self, lr, layer_idx=None):
+        for idx, group in enumerate(self.optimizer.param_groups):
+            if (layer_idx is None) or (idx == layer_idx):
+                group['lr'] = lr
+    
     def save(self, path):
         checkpoint = {
             'model_state_dict': self.model.state_dict(),
@@ -226,7 +229,7 @@ class Trainer:
             'config': self.config,
             'loss_by_layer': self.loss_by_layer,
             'last_layer_loss': self.last_layer_loss,
-            'time': self.times,
+            'times': self.times,
             'n': self.n,
             'D': self.D
         }
@@ -244,6 +247,7 @@ class Trainer:
         trainer.times = checkpoint['times']
         trainer.n = checkpoint['n']
         trainer.D = checkpoint['D']
+        trainer.time_repair()
         return trainer
 
     def clear_stats(self):
@@ -254,48 +258,73 @@ class Trainer:
         self.n = 0
         self.D = 0 # total data
 
+    def time_repair(self):
+        excess = self.times[0]
+        sum_dt = 0.00
+        cnt_dt = 0.01
+        for idx in range(len(self.times)-1):
+            dt = self.times[idx+1] - self.times[idx]
+
+            self.times[idx] -= excess
+            if dt > 10.0:
+                excess += dt - sum_dt/cnt_dt
+            else:
+                sum_dt += dt
+                cnt_dt += 1
+        self.times[-1] -= excess
+        delta = time.time() - self.times[-1] 
+        self.times = [t + delta for t in self.times]
+
     def train(self):
+        # read config
         batch_size = self.config['batch_size']
         example_length = self.config['example_length']
 
+        # get batch of training examples
         if len(self.inbox) > 0:
             batch = self.inbox.pop()
         else:
             batch = self.dataset.batch(batch_size=batch_size,
                                        example_length=example_length)
-        self.D += batch_size * example_length
+        
+        # perform forward pass
         losses = self.model.losses(batch)
         losses = torch.nan_to_num(losses, nan=0.0, posinf=0.0, neginf=0.0)
         loss = torch.mean(losses)
+
+        # perform optimization
+        loss.backward()
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+        
+        # compute stats
         batch_loss_by_layer = np.mean(losses.detach().cpu().numpy(), axis=(1,2)) # over bs and pos
         batch_last_layer_loss_by_pos = np.mean(losses[-1].detach().cpu().numpy(), axis=0) # over bs
         batch_last_layer_loss = np.mean(batch_last_layer_loss_by_pos)
-        loss.backward()
-
-        batch_loss_by_layer, batch_last_layer_loss = self.optimizer.step()
-        self.optimizer.zero_grad()
-
-        self.n += 1
+        
+        # save data
         self.loss_by_layer.append(batch_loss_by_layer)
         self.last_layer_loss.append(batch_last_layer_loss)
         self.times.append(time.time())
+        self.n += 1
+        self.D += batch_size * example_length
 
     def autocomplete(self,
                      prompt=None,
-                     n_ctx=None,
                      temp=1.0,
                      n_generate=512,
+                     n_ctx=None,
                      output_layer=-1):
         Categorical = torch.distributions.Categorical
+        if prompt is None:
+            prompt = """In a shocking finding, scientists discovered a herd of unicorns living in a
+remote, previously unexplored valley in the Andes Mountains. Even more
+surprising to the researchers was the fact that the unicorns spoke perfect
+English."""
+        n_vocab_out = self.config['n_vocab_out']
+        input_ids = self.dataset.encode(prompt)
         if n_ctx is None:
             n_ctx = 512
-        if prompt is None:
-            prompt ="""In a shocking finding, scientists discovered a herd of unicorns living in a
-    remote, previously unexplored valley in the Andes Mountains. Even more
-    surprising to the researchers was the fact that the unicorns spoke perfect
-    English."""
-        n_vocab_out = self.model.n_vocab_out
-        input_ids = self.dataset.encode(prompt)
         input_ids = input_ids[-n_ctx:]
         prompt = self.dataset.decode(input_ids)
         device='cuda'
@@ -319,7 +348,7 @@ class Trainer:
                      n_generate=512,
                      output_layer=-1):
         
-        sampler = self.autocomplete(prompt, n_ctx, temp, n_generate, output_layer)
+        sampler = self.autocomplete(prompt=prompt, temp=temp, n_generate=n_generate, n_ctx=n_ctx, output_layer=output_layer)
         display_handle = display(HTML(prompt), display_id=True)
         list_of_tokens = []
         async for c in sampler:
