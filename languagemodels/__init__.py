@@ -1,5 +1,5 @@
-from . import languagemodels
+from . import model
 from . import dataset
 
-from languagemodels import Mask, Attn, TransformerLayer, Transformer, TextInput, TextOutput, LanguageModel, Trainer
+from model import Mask, Attn, TransformerLayer, Transformer, TextInput, TextOutput, LanguageModel, Trainer
 from dataset import utf8decode, utf8encode, utf8bitsdecode, utf8bitsencode, FastPileBytesDataset
