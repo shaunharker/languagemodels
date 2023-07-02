@@ -121,3 +121,7 @@ class FastPileBytesDataset:
         self.idx += batch_size
         return result
     
+# """
+# Unused bytes in utf-8 encodings:
+# [0, 2, 4, 5, 6, 11, 14, 15, 20, 21, 22, 23, 26, 27, 28, 29, 30, 31, 127, 192, 193, 222, 223, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255]
+# """

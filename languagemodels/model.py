@@ -7,7 +7,7 @@ from .dataset import FastPileBytesDataset
 import time
 import asyncio
 import torch
-from torch.optim import AdamW
+from .optimizer import CustomAdamW
 from IPython.display import display, HTML
 
 
@@ -91,7 +91,7 @@ class Transformer(Module):
         self.d_hidden = d_hidden
         self.n_layers = n_layers
 
-        self.layers = ModuleList(TransformerLayer(d_model, d_k, d_v, n_heads, d_hidden) for _ in n_layers)
+        self.layers = ModuleList(TransformerLayer(d_model, d_k, d_v, n_heads, d_hidden) for _ in range(n_layers))
 
 
     def forward(self, x):
@@ -132,22 +132,30 @@ class Transformer(Module):
 
 class TextInput(Module):
     def __init__(self, n_vocab_in, d_model):
+        super().__init__()
         self.n_vocab_in = n_vocab_in
         self.d_model = d_model
         self.linear = Linear(d_model, d_model, bias=False)
         self.linear.weight.data *= 0.0
         self.embedding = Embedding(n_vocab_in, d_model)
+        self.bos = 0
 
     def forward(self, input_ids):
-        x = self.embedding(input_ids)
-        n_ctx = input_ids.shape[-1]
-        for idx in range(n_ctx-1):
-            x[...,idx+1,:] += self.linear(x[...,idx,:])
-        return x
+        padded_input_ids = pad(input_ids, (1, 0), "constant", self.bos)
+        n_ctx = padded_input_ids.shape[-1]
+        x = self.embedding(padded_input_ids)
+        xs = []
+        for idx in range(n_ctx):
+            if idx == 0:
+                xs.append(x[...,idx,:])
+            else:
+                xs.append(x[...,idx,:] + self.linear(xs[-1]))
+        return torch.stack(xs,dim=-2)
 
 
 class TextOutput(Module):
     def __init__(self, n_vocab_out, d_model):
+        super().__init__()
         self.n_vocab_out = n_vocab_out
         self.d_model = d_model
         self.linear = Linear(d_model, n_vocab_out)
@@ -160,7 +168,6 @@ class LanguageModel(Module):
     def __init__(self,
                  n_vocab_in=256,
                  n_vocab_out=256,
-                 n_ctx=512,
                  d_model=1024,
                  d_k=64,
                  d_v=64,
@@ -168,14 +175,10 @@ class LanguageModel(Module):
                  d_hidden=4096,
                  n_layers=16,
                  bos=0):
-        """
-        Unused bytes in utf-8 encodings:
-        [0, 2, 4, 5, 6, 11, 14, 15, 20, 21, 22, 23, 26, 27, 28, 29, 30, 31, 127, 192, 193, 222, 223, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255]
-        """
+  
         super().__init__()
         self.n_vocab_in = n_vocab_in
         self.n_vocab_out = n_vocab_out
-        self.n_ctx = n_ctx
         self.d_model = d_model
         self.d_k = d_k
         self.d_v = d_v
@@ -186,7 +189,6 @@ class LanguageModel(Module):
         self.text_input = TextInput(n_vocab_in=n_vocab_in, d_model=d_model)
         self.module = Transformer(n_vocab_in=n_vocab_in,
                                   n_vocab_out=n_vocab_out,
-                                  n_ctx=n_ctx,
                                   d_model=d_model,
                                   d_k=d_k,
                                   d_v=d_v,
@@ -201,8 +203,7 @@ class LanguageModel(Module):
         """
         Note: adds 1 to length, as it inserts a 0th column for bos token
         """
-        padded_input_ids = pad(input_ids, (1, 0), "constant", self.bos)
-        x = self.text_input(padded_input_ids)
+        x = self.text_input(input_ids)
         xs = self.module(x)
         logits = self.text_output(xs) # logits.shape == (n_layers+1, batch_size, example_length, n_vocab_out)
         probs = self.softmax(logits)  # (n_layers+1, batch_size, example_length, n_vocab_out)
@@ -211,14 +212,16 @@ class LanguageModel(Module):
     def losses(self, output_ids):
         input_ids = output_ids[...,:-1]
         probs = self.forward(input_ids) # (n_layers+1, batch_size, example_length, n_vocab_out)
-        output_ids = torch.stack([output_ids] * (self.n_layers+1)) # (n_layers+1, batch_size, example_length) uint8_t data (torch.long storage)
+        output_ids = torch.stack([output_ids] * probs.shape[0]).unsqueeze(-1) # (n_layers+1, batch_size, example_length, 1) uint8_t data (torch.long storage)
         return -torch.gather(probs, dim=-1, index=output_ids).log2() # cross entropy samples
 
 class Trainer:
     def __init__(self,
+                 model=None,
                  example_length=512,
                  batch_size=1,
-                 batch_multiplier=8):
+                 batch_multiplier=8,
+                 lr=1e-6):
         """
         example_length: length of examples to use for training
         batch_size: number of examples in a single batch
@@ -231,8 +234,14 @@ class Trainer:
         self.batch_size = batch_size
         self.batch_multiplier = batch_multiplier
         self.dataset = FastPileBytesDataset(example_length=512)
-        self.model = LanguageModel()
-        self.optimizer = AdamW(self.model.named_parameters())
+        self.model = model if model is not None else LanguageModel().to('cuda')
+
+        self.optimizer = CustomAdamW(
+            [{'params': self.model.text_input.parameters(), 'lr': 1e-5}] +
+            [{'params': self.model.text_output.parameters(), 'lr': 2e-4}] +
+            [{'params': layer.parameters(), 'lr': 2e-4} for layer in self.model.module.layers],
+            lr=lr, batch_multiplier=batch_multiplier)
+
         self.inbox = []
         self.loss_by_layer = []
         self.last_layer_loss = []
@@ -241,6 +250,22 @@ class Trainer:
         self.n = 0
         self.D = 0 # total data
 
+    def save(self, path):
+        torch.save({
+            'state_dict': self.state_dict(),
+            'config': self.get_config()
+        }, f=path)
+
+    @staticmethod
+    def load(path):
+        module = Transformer.load(path)
+        module.load_state_dict(sd)
+        return module
+
+    def set_lr(self, lr):
+        for pn in self.optimizer.parameters:
+            self.optimizer.state[pn]['lr'] = lr
+    
     def clear_stats(self):
         self.inbox = []
         self.loss_by_layer = []
@@ -250,25 +275,22 @@ class Trainer:
         self.D = 0 # total data
 
     def train(self):
-        def closure():
-            if len(self.inbox) > 0:
-                batch = self.inbox.pop()
-            if batch is None:
-                batch = self.dataset.batch(batch_size=self.batch_size, example_length=self.example_length)
-            self.D += self.batch_size * self.example_length
-            losses = self.model.losses(batch)
-            losses = torch.nan_to_num(losses, nan=0.0, posinf=0.0, neginf=0.0)
-            loss = torch.mean(losses)
-            batch_loss_by_layer = np.mean(losses.detach().cpu().numpy(), axis=(1,2)) # over bs and pos
-            batch_last_layer_loss_by_pos = np.mean(losses[-1].detach().cpu().numpy(), axis=0) # over bs
-            batch_last_layer_loss = np.mean(batch_last_layer_loss_by_pos)
-            loss.backward()
-            return batch_loss_by_layer, batch_last_layer_loss
-        if self.n % self.batch_multiplier == 0:
-            batch_loss_by_layer, batch_last_layer_loss = self.optimizer.step(closure)
-            self.optimizer.zero_grad()
+        if len(self.inbox) > 0:
+            batch = self.inbox.pop()
         else:
-            batch_loss_by_layer, batch_last_layer_loss = closure()
+            batch = self.dataset.batch(batch_size=self.batch_size, example_length=self.example_length)
+        self.D += self.batch_size * self.example_length
+        losses = self.model.losses(batch)
+        losses = torch.nan_to_num(losses, nan=0.0, posinf=0.0, neginf=0.0)
+        loss = torch.mean(losses)
+        batch_loss_by_layer = np.mean(losses.detach().cpu().numpy(), axis=(1,2)) # over bs and pos
+        batch_last_layer_loss_by_pos = np.mean(losses[-1].detach().cpu().numpy(), axis=0) # over bs
+        batch_last_layer_loss = np.mean(batch_last_layer_loss_by_pos)
+        loss.backward()
+
+        batch_loss_by_layer, batch_last_layer_loss = self.optimizer.step()
+        self.optimizer.zero_grad()
+
         self.n += 1
         self.loss_by_layer.append(batch_loss_by_layer)
         self.last_layer_loss.append(batch_last_layer_loss)
@@ -288,14 +310,12 @@ class Trainer:
     remote, previously unexplored valley in the Andes Mountains. Even more
     surprising to the researchers was the fact that the unicorns spoke perfect
     English."""
-        if device is None:
-            device = self.model.device
-        n_vocab_out = self.n_vocab_out
+        n_vocab_out = self.model.n_vocab_out
         input_ids = self.dataset.encode(prompt)
         input_ids = input_ids[-n_ctx:]
         prompt = self.dataset.decode(input_ids)
-
-        async def sampler():
+        device='cuda'
+        async def sampler(input_ids):
             for _ in range(n_generate):
                 await asyncio.sleep(0)  # Give other tasks a chance to run
                 probs = self.model(torch.tensor(input_ids, dtype=torch.long, device=device).unsqueeze(0))[output_layer].view(-1)[-n_vocab_out:]
@@ -306,7 +326,7 @@ class Trainer:
                 input_ids = (input_ids + [y])[-n_ctx:]
                 yield y
 
-        return sampler
+        return sampler(list(input_ids))
     
     async def display_autocomplete(self,
                      prompt=None,
@@ -318,7 +338,7 @@ class Trainer:
         sampler = self.autocomplete(prompt, n_ctx, temp, n_generate, output_layer)
         display_handle = display(HTML(prompt), display_id=True)
         list_of_tokens = []
-        async for c in sampler():
+        async for c in sampler:
             list_of_tokens.append(c)
             completion = self.dataset.decode(list_of_tokens)
             def cleanup(s):
