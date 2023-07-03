@@ -6,13 +6,6 @@ import math
 import torch
 from torch.nn import Module, Linear, Embedding, ModuleList, LayerNorm, GELU
 from torch.nn.functional import pad
-import numpy as np
-from .dataset import FastPileBytesDataset
-import time
-import asyncio
-import torch
-from .optimizer import CustomAdamW
-from IPython.display import display, HTML
 
 
 class Mask(Module):
