@@ -81,16 +81,24 @@ class Transformer(Module):
 class TextInput(Module):
     def __init__(self, n_vocab_in, d_model, bos=0):
         super().__init__()
-        self.linear = Linear(d_model, d_model, bias=False)
-        self.linear.weight.data *= 0.0
         self.embedding = Embedding(n_vocab_in, d_model)
         self.bos = bos
 
     def forward(self, input_ids):
         padded_input_ids = pad(input_ids, (1, 0), "constant", self.bos)
-        n_ctx = padded_input_ids.shape[-1]
         x = self.embedding(padded_input_ids)
+        return x
+
+
+class LinearAutoregression(Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.linear = Linear(d_model, d_model, bias=False)
+        self.linear.weight.data *= 0.0
+
+    def forward(self, x):
         xs = []
+        n_ctx = x.shape[-1]
         for idx in range(n_ctx):
             if idx == 0:
                 xs.append(x[...,idx,:])
