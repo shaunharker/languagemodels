@@ -1,3 +1,7 @@
+# Author: Shaun Harker
+# Date: 2023-07-02
+# License: MIT
+
 import types
 import numpy as np
 import torch
