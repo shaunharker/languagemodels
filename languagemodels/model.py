@@ -3,7 +3,7 @@
 # License: MIT
 
 import torch
-from torch.nn import Module, Linear, Embedding
+from torch.nn import Module, Linear, Embedding, ModuleList
 from torch.nn.functional import pad
 
 
@@ -20,15 +20,22 @@ class TextInput(Module):
 
 
 class TextOutput(Module):
-    def __init__(self, n_vocab_out, d_model):
+    def __init__(self, n_vocab_out, d_model, n_layers):
         super().__init__()
-        self.linear = Linear(d_model, n_vocab_out, bias=False)
+        self.n_vocab_out = n_vocab_out
+        self.d_model = d_model
+        self.read_heads = ModuleList(Linear(d_model, n_vocab_out, bias=True) for _ in range(n_layers))
         self.softmax = torch.nn.Softmax(dim=-1)
 
     def forward(self, x):
-        logits = self.linear(x)
+        # x.shape == (n_layers+1, batch_size, example_length, n_vocab_out)
+        logits = torch.stack([self.read_heads[idx](x[idx]) for idx in range(x.shape[0])])
         probs = self.softmax(logits)
         return probs
+    
+    def add_layer(self):
+        device = self.read_heads[0].weight.device
+        self.read_heads.append(Linear(self.d_model, self.n_vocab_out, bias=True).to(device)) 
 
 
 class LanguageModel(Module):
@@ -40,8 +47,12 @@ class LanguageModel(Module):
         super().__init__()
         self.text_input = TextInput(n_vocab_in=n_vocab_in, d_model=module.d_model, bos=bos)
         self.module = module
-        self.text_output = TextOutput(n_vocab_out=n_vocab_out, d_model=module.d_model)
+        self.text_output = TextOutput(n_vocab_out=n_vocab_out, d_model=module.d_model, n_layers=1+module.n_layers)
         
+    def add_layer(self):
+        self.module.add_layer()
+        self.text_output.add_layer()
+
     def forward(self, input_ids):
         """
         Note: adds 1 to length, as it inserts a 0th column for bos token
