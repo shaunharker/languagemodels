@@ -34,7 +34,7 @@ class TransformerLayer(Module):
         (Q, K, V) = map(split_heads,(self.query_proj(x),self.key_proj(x),self.value_proj(x)))
         mask = (1-1/torch.tril(torch.ones((n_ctx,n_ctx),device=device)))
         QKT = torch.matmul(Q/math.sqrt(self.d_k),K.transpose(-1,-2)) + mask
-        x = x + self.ln1(self.linear(merge_heads(self.softmax(self.mask(QKT))@V)))
+        x = x + self.ln1(self.linear(merge_heads(self.softmax(QKT)@V)))
         x = x + self.ln2(self.ff2(self.nonlinearity(self.ff1(x))))
         return x
 
@@ -43,6 +43,7 @@ class Transformer(Module):
     def __init__(self, **config):
         super().__init__()
         self.config = config
+        self.d_model = config['d_model']
         self.n_layers = self.config.pop('n_layers')
         self.layers = ModuleList(TransformerLayer(**config) for _ in range(self.n_layers))
 
