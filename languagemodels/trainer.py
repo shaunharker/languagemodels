@@ -10,6 +10,7 @@ from IPython.display import display, HTML
 
 from .dataset import FastPileBytesDataset
 from .model import LanguageModel
+from .transformer import Transformer
 from .optimizer import CustomAdamW
 
 class Trainer:
@@ -18,11 +19,7 @@ class Trainer:
                  batch_size=1,
                  n_vocab_in=256,
                  n_vocab_out=256,
-                 d_model=1024,
-                 d_k=64,
-                 d_v=64,
-                 n_heads=16,
-                 n_layers=16,
+                 module=None,
                  bos=0,
                  lr=1e-6,
                  betas=(.9, .999),
@@ -41,11 +38,6 @@ class Trainer:
             'batch_size': batch_size,
             'n_vocab_in': n_vocab_in,
             'n_vocab_out': n_vocab_out,
-            'd_model': d_model,
-            'd_k': d_k,
-            'd_v': d_v,
-            'n_heads': n_heads,
-            'n_layers': n_layers,
             'bos': bos,
             'lr': lr,
             'betas': betas,
@@ -54,19 +46,8 @@ class Trainer:
         }
 
         self.dataset = FastPileBytesDataset(example_length=512)
-        self.model = LanguageModel(n_vocab_in=n_vocab_in,
-                                   n_vocab_out=n_vocab_out,
-                                   d_model=d_model,
-                                   d_k=d_k,
-                                   d_v=d_v,
-                                   n_heads=n_heads,
-                                   n_layers=n_layers,
-                                   bos=bos).to('cuda')
-        self.optimizer = CustomAdamW(
-            [{'params': layer.parameters()} for layer in self.model.module.layers] +
-            [{'params': self.model.text_input.parameters()}] +
-            [{'params': self.model.text_output.parameters()}],
-            lr=lr, betas=betas, weight_decay=weight_decay, batch_multiplier=batch_multiplier)
+        if module is not None:
+            self.install_module(module)
 
         self.inbox = []
         self.loss_by_layer = []
@@ -74,6 +55,18 @@ class Trainer:
         self.times = []
         self.n = 0
         self.D = 0 # total data
+
+    def install_module(self, module):
+        self.module = module
+        self.model = LanguageModel(n_vocab_in=self.config['n_vocab_in'],
+                                   n_vocab_out=self.config['n_vocab_out'],
+                                   bos=self.config['bos'],
+                                   module=module).to('cuda')
+        self.optimizer = CustomAdamW(
+            [{'params': layer.parameters()} for layer in self.model.module.layers] +
+            [{'params': self.model.text_input.parameters()}] +
+            [{'params': self.model.text_output.parameters()}],
+            lr=self.config['lr'], betas=self.config['betas'], weight_decay=self.config['weight_decay'], batch_multiplier=self.config['batch_multiplier'])
 
     def update_lr(self, lr, layer_idx=None):
         for idx, group in enumerate(self.optimizer.param_groups):
@@ -94,10 +87,13 @@ class Trainer:
         torch.save(checkpoint, path)
 
     @classmethod
-    def load(cls, path):
+    def load(cls, path, module=None):
         checkpoint = torch.load(path)
         config = checkpoint['config']
         trainer = cls(**config)  # Make Trainer instance with same arguments
+        if module is None:
+            module = Transformer()
+        trainer.install_module(module)
         trainer.model.load_state_dict(checkpoint['model_state_dict'])
         #trainer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         trainer.loss_by_layer = checkpoint['loss_by_layer']
