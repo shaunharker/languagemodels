@@ -22,7 +22,6 @@ class Trainer:
                  d_k=64,
                  d_v=64,
                  n_heads=16,
-                 d_hidden=4096,
                  n_layers=16,
                  bos=0,
                  lr=1e-6,
@@ -46,7 +45,6 @@ class Trainer:
             'd_k': d_k,
             'd_v': d_v,
             'n_heads': n_heads,
-            'd_hidden': d_hidden,
             'n_layers': n_layers,
             'bos': bos,
             'lr': lr,
@@ -62,7 +60,6 @@ class Trainer:
                                    d_k=d_k,
                                    d_v=d_v,
                                    n_heads=n_heads,
-                                   d_hidden=d_hidden,
                                    n_layers=n_layers,
                                    bos=bos).to('cuda')
         self.optimizer = CustomAdamW(

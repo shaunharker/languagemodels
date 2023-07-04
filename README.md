@@ -1,5 +1,26 @@
 # languagemodels
 
+
+### unused but potentially future useful code
+
+```python
+class LinearAutoregression(Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.linear = Linear(d_model, d_model, bias=False)
+        self.linear.weight.data *= 0.0
+
+    def forward(self, x):
+        xs = []
+        n_ctx = x.shape[-1]
+        for idx in range(n_ctx):
+            if idx == 0:
+                xs.append(x[...,idx,:])
+            else:
+                xs.append(x[...,idx,:] + self.linear(xs[-1]))
+        return torch.stack(xs,dim=-2)
+```
+
 ```python
     def empirical_training(self, xy, q, k):
         """
