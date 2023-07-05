@@ -5,7 +5,7 @@
 import math
 import torch
 from torch.nn import Module, Linear, ModuleList, LayerNorm, GELU
-
+from torch.nn.functional import softmax
 
 class TransformerLayer(Module):
     def __init__(self, d_model, d_k, d_v, n_heads, d_hidden):
@@ -17,7 +17,6 @@ class TransformerLayer(Module):
         self.query_proj = Linear(d_model, d_k*n_heads, bias=True)
         self.key_proj = Linear(d_model, d_k*n_heads, bias=True)
         self.value_proj = Linear(d_model, d_v*n_heads, bias=True)
-        self.softmax = torch.nn.Softmax(dim=-1)
         self.linear = Linear(d_v*n_heads, d_model, bias=False)
         self.ln1 = LayerNorm(d_model)
 
@@ -34,7 +33,7 @@ class TransformerLayer(Module):
         (Q, K, V) = map(split_heads,(self.query_proj(x),self.key_proj(x),self.value_proj(x)))
         mask = (1-1/torch.tril(torch.ones((n_ctx,n_ctx),device=device)))
         QKT = torch.matmul(Q/math.sqrt(self.d_k),K.transpose(-1,-2)) + mask
-        x = x + self.ln1(self.linear(merge_heads(self.softmax(QKT)@V)))
+        x = x + self.ln1(self.linear(merge_heads(softmax(QKT, dim=-1)@V)))
         x = x + self.ln2(self.ff2(self.nonlinearity(self.ff1(x))))
         return x
 

@@ -46,12 +46,6 @@ class CustomAdamW(Optimizer):
         super().__init__(params, defaults)
         self.n = 0
         self.state = {}
-        for group in self.param_groups:
-            for p in group['params']:
-                betas = group['betas']
-                self.state[p] = {
-                    'G': EMAFilter(betas[0], init="zeros"),
-                    'G2': EMAFilter(betas[1], init="zeros")}
         self.zero_grad()
 
     def step(self, closure=None):
@@ -60,6 +54,9 @@ class CustomAdamW(Optimizer):
             for p in group['params']:
                 if p.grad is None:
                     continue
+                if p not in self.state:
+                    self.state[p] = {'G': EMAFilter(group['betas'][0], init="zeros"), 
+                                     'G2': EMAFilter(group['betas'][1], init="zeros")}
                 state = self.state[p]
                 g = torch.nan_to_num(p.grad.data, nan=0.0, posinf=0.0, neginf=0.0)
                 G = state['G'](g)

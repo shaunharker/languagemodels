@@ -4,7 +4,7 @@
 
 import torch
 from torch.nn import Module, Linear, Embedding, ModuleList
-from torch.nn.functional import pad
+from torch.nn.functional import pad, softmax
 
 
 class TextInput(Module):
@@ -24,18 +24,17 @@ class TextOutput(Module):
         super().__init__()
         self.n_vocab_out = n_vocab_out
         self.d_model = d_model
-        self.read_heads = ModuleList(Linear(d_model, n_vocab_out, bias=True) for _ in range(n_layers))
-        self.softmax = torch.nn.Softmax(dim=-1)
+        self.read_heads = ModuleList(Linear(d_model, n_vocab_out, bias=False) for _ in range(n_layers))
 
     def forward(self, x):
         # x.shape == (n_layers+1, batch_size, example_length, n_vocab_out)
         logits = torch.stack([self.read_heads[idx](x[idx]) for idx in range(x.shape[0])])
-        probs = self.softmax(logits)
+        probs = softmax(logits, dim=-1)
         return probs
     
     def add_layer(self):
         device = self.read_heads[0].weight.device
-        self.read_heads.append(Linear(self.d_model, self.n_vocab_out, bias=True).to(device)) 
+        self.read_heads.append(Linear(self.d_model, self.n_vocab_out, bias=False).to(device)) 
 
 
 class LanguageModel(Module):

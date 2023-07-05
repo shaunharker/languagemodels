@@ -8,3 +8,4 @@ from .dataset import utf8decode, utf8encode, utf8bitsdecode, utf8bitsencode, Fas
 from .optimizer import CustomAdamW
 from .trainer import Trainer
 from .transformer import Transformer, TransformerLayer
+from .attentiononlytransformer import AttentionOnlyTransformer, MultiHeadAttentionLayer

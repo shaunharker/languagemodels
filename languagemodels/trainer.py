@@ -65,7 +65,7 @@ class Trainer:
         self.optimizer = CustomAdamW(
             [{'params': layer.parameters()} for layer in self.model.module.layers] +
             [{'params': self.model.text_input.parameters()}] +
-            [{'params': self.model.text_output.parameters()}],
+            [{'params': [p]} for p in self.model.text_output.parameters()],
             lr=self.config['lr'], betas=self.config['betas'], weight_decay=self.config['weight_decay'], batch_multiplier=self.config['batch_multiplier'])
 
     def update_lr(self, lr, layer_idx=None):
@@ -73,6 +73,10 @@ class Trainer:
             if (layer_idx is None) or (idx == layer_idx):
                 group['lr'] = lr
     
+    def add_layer(self, **optim_args):
+        self.model.add_layer()
+        self.optimizer.add_param_group({'params': [list(self.model.text_output.parameters())[-1]], **optim_args})
+
     def save(self, path):
         checkpoint = {
             'model_state_dict': self.model.state_dict(),
