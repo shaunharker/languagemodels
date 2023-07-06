@@ -10,17 +10,17 @@ from IPython.display import display, HTML
 
 from .dataset import FastPileBytesDataset
 from .model import LanguageModel
-from .transformer import Transformer
 from .optimizer import CustomAdamW
+
+import torch
+from torch.nn import Module, Linear, LayerNorm, GELU
+from torch.nn.functional import softmax
 
 class Trainer:
     def __init__(self,
                  example_length=512,
                  batch_size=1,
-                 n_vocab_in=256,
-                 n_vocab_out=256,
-                 module=None,
-                 bos=0,
+                 model=None,
                  lr=1e-6,
                  betas=(.9, .999),
                  weight_decay=0.001,
@@ -36,9 +36,6 @@ class Trainer:
         self.config = {
             'example_length': example_length,
             'batch_size': batch_size,
-            'n_vocab_in': n_vocab_in,
-            'n_vocab_out': n_vocab_out,
-            'bos': bos,
             'lr': lr,
             'betas': betas,
             'weight_decay': weight_decay,
@@ -46,8 +43,12 @@ class Trainer:
         }
 
         self.dataset = FastPileBytesDataset(example_length=512)
-        if module is not None:
-            self.install_module(module)
+        self.model = model.to('cuda')
+        self.optimizer = CustomAdamW(
+            [{'params': layer.parameters()} for layer in self.model.layers] +
+            [{'params': self.model.text_input.parameters()}] +
+            [{'params': [p]} for p in self.model.text_output.parameters()],
+            lr=self.config['lr'], betas=self.config['betas'], weight_decay=self.config['weight_decay'], batch_multiplier=self.config['batch_multiplier'])
 
         self.inbox = []
         self.loss_by_layer = []
@@ -55,18 +56,6 @@ class Trainer:
         self.times = []
         self.n = 0
         self.D = 0 # total data
-
-    def install_module(self, module):
-        self.module = module
-        self.model = LanguageModel(n_vocab_in=self.config['n_vocab_in'],
-                                   n_vocab_out=self.config['n_vocab_out'],
-                                   bos=self.config['bos'],
-                                   module=module).to('cuda')
-        self.optimizer = CustomAdamW(
-            [{'params': layer.parameters()} for layer in self.model.module.layers] +
-            [{'params': self.model.text_input.parameters()}] +
-            [{'params': [p]} for p in self.model.text_output.parameters()],
-            lr=self.config['lr'], betas=self.config['betas'], weight_decay=self.config['weight_decay'], batch_multiplier=self.config['batch_multiplier'])
 
     def update_lr(self, lr, layer_idx=None):
         for idx, group in enumerate(self.optimizer.param_groups):
@@ -79,8 +68,7 @@ class Trainer:
 
     def save(self, path):
         checkpoint = {
-            'model_state_dict': self.model.state_dict(),
-            #'optimizer_state_dict': self.optimizer.state_dict(),
+            'model': self.model.serialize(),
             'config': self.config,
             'loss_by_layer': self.loss_by_layer,
             'last_layer_loss': self.last_layer_loss,
@@ -91,15 +79,10 @@ class Trainer:
         torch.save(checkpoint, path)
 
     @classmethod
-    def load(cls, path, module=None):
+    def load(cls, path):
         checkpoint = torch.load(path)
-        config = checkpoint['config']
-        trainer = cls(**config)  # Make Trainer instance with same arguments
-        if module is None:
-            module = Transformer()
-        trainer.install_module(module)
-        trainer.model.load_state_dict(checkpoint['model_state_dict'])
-        #trainer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        model = LanguageModel(**checkpoint['model'])
+        trainer = cls(**checkpoint['config'], model=model)
         trainer.loss_by_layer = checkpoint['loss_by_layer']
         trainer.last_layer_loss = checkpoint['last_layer_loss']
         trainer.times = checkpoint['times']
@@ -123,6 +106,8 @@ class Trainer:
         of 10 seconds is assumed to be do to halted training, and
         thus will be removed and replaced with an average time gap.
         """
+        if len(self.times) == 0:
+            return
         excess = self.times[0]
         sum_dt = 0.00
         cnt_dt = 0.01
@@ -172,54 +157,15 @@ class Trainer:
         self.n += 1
         self.D += batch_size * example_length
 
-    def autocomplete(self,
-                     prompt=None,
-                     temp=1.0,
-                     n_generate=512,
-                     n_ctx=None,
-                     output_layer=-1):
-        Categorical = torch.distributions.Categorical
-        if prompt is None:
-            prompt = """In a shocking finding, scientists discovered a herd of unicorns living in a
-remote, previously unexplored valley in the Andes Mountains. Even more
-surprising to the researchers was the fact that the unicorns spoke perfect
-English."""
-        n_vocab_out = self.config['n_vocab_out']
-        input_ids = self.dataset.encode(prompt)
-        if n_ctx is None:
-            n_ctx = 512
-        input_ids = input_ids[-n_ctx:]
-        prompt = self.dataset.decode(input_ids)
-        device='cuda'
-        async def sampler(input_ids):
-            for _ in range(n_generate):
-                await asyncio.sleep(0)  # Give other tasks a chance to run
-                probs = self.model(torch.tensor(input_ids, dtype=torch.long, device=device).unsqueeze(0))[output_layer].view(-1)[-n_vocab_out:]
-                if temp > 0:
-                    y = Categorical(probs=probs**(1.0/temp)).sample().item()
-                else:
-                    y = torch.argmax(probs).item()
-                input_ids = (input_ids + [y])[-n_ctx:]
-                yield y
-
-        return sampler(list(input_ids))
-    
-    async def display_autocomplete(self,
-                     prompt=None,
-                     n_ctx=None,
-                     temp=1.0,
-                     n_generate=512,
-                     output_layer=-1):
-        
-        sampler = self.autocomplete(prompt=prompt, temp=temp, n_generate=n_generate, n_ctx=n_ctx, output_layer=output_layer)
-        display_handle = display(HTML(prompt), display_id=True)
-        list_of_tokens = []
-        async for c in sampler:
-            list_of_tokens.append(c)
-            completion = self.dataset.decode(list_of_tokens)
-            def cleanup(s):
-                return s.replace('<', '&lt;').replace('>', '&gt;')
-            contents = ('<pre style="background: black; color: lime; font-family: monospace">'+
-                    '<span style="color: white">' + cleanup(prompt) + '</span>' + cleanup(completion) + '\n'*20 + '</pre>')
-            display_handle.update(HTML(contents))
-        return display_handle
+    # def experimental_train(self):
+    #     fork = lambda x: x.detach().clone().requires_grad_(True)
+    #     layer_pairs = list(zip(self.model.module.layers[:-1], self.model.module.layers[1:]))
+    #     if not hasattr(self, 'optimizers'):
+    #         optimizers = [optimizer([*layer1.parameters(), *layer2.parameters()]) for (layer1, layer2) in layer_pairs]
+    #     x, y = training_pair()
+    #     x = x.detach()
+    #     for ((layer, next_layer), optimizer) in zip(layer_pairs, optimizers):
+    #         optimizer.zero_grad()
+    #         criterion(next_layer(layer(fork(x))),y).backward()
+    #         optimizer.step()
+    #         x = layer(x)
