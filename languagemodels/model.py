@@ -21,6 +21,11 @@ class TextInput(Module):
     def forward(self, input_ids):
         return one_hot(pad(input_ids, (1, 0), "constant", self.bos), self.d_model).float()
 
+    def append_layer(self, **kwargs):
+        return []
+
+    def prepend_layer(self, **kwargs):
+        return []
 
 class TextOutput(Module):
     def __init__(self, n_vocab_out, d_model, **kwargs):
@@ -33,25 +38,39 @@ class TextOutput(Module):
         probs = softmax(logits, dim=-1)
         return probs
     
+    def append_layer(self, **kwargs):
+        return []
+
+    def prepend_layer(self, **kwargs):
+        return []
+
 
 class TextInputEmbedding(Module):
-    def __init__(self, n_vocab_in, d_model, bos=0, **kwargs):
+    def __init__(self, n_vocab_in, d_model, bos=0, init_scale=1.0):
         super().__init__()
         self.bos = bos
         self.embedding = Embedding(n_vocab_in, d_model)
+        self.embedding.weight.data *= init_scale
 
     def forward(self, input_ids):
         padded_input_ids = pad(input_ids, (1, 0), "constant", self.bos)
         x = self.embedding(padded_input_ids)
         return x
 
+    def append_layer(self, **kwargs):
+        return []
+
+    def prepend_layer(self, **kwargs):
+        return []
 
 class TextOutputReadHeads(Module):
-    def __init__(self, n_vocab_out, d_model, n_layers, **kwargs):
+    def __init__(self, n_vocab_out, d_model, n_layers, init_scale=0.0):
         super().__init__()
         self.n_vocab_out = n_vocab_out
         self.d_model = d_model
         self.read_heads = ModuleList(Linear(d_model, n_vocab_out, bias=False) for _ in range(n_layers+1))
+        for read_head in self.read_heads:
+            read_head.weight.data *= init_scale
 
     def forward(self, x):
         # x.shape == (n_layers+1, batch_size, example_length, n_vocab_out)
@@ -59,13 +78,24 @@ class TextOutputReadHeads(Module):
         probs = softmax(logits, dim=-1)
         return probs
     
-    def add_layer(self, device=None):
-        if device is None:
-            try:
-                device = next(self.parameters()).device
-            except:
-                device = 'cpu'
-        self.read_heads.append(Linear(self.d_model, self.n_vocab_out, bias=False).to(device)) 
+    @property
+    def device(self):
+        try:
+            return next(self.parameters()).device
+        except:
+            return 'cpu'
+        
+    def append_layer(self, **kwargs):
+        layer = Linear(self.d_model, self.n_vocab_out, bias=False).to(self.device)
+        layer.weight.data.copy_(self.read_heads[-1].weight.data)
+        self.read_heads.append(layer)
+        return list(self.read_heads[-1].parameters())
+
+    def prepend_layer(self, **kwargs):
+        layer = Linear(self.d_model, self.n_vocab_out, bias=False).to(self.device)
+        layer.weight.data.copy_(self.read_heads[0].weight.data)
+        self.read_heads.insert(0, layer)
+        return list(self.read_heads[0].parameters())
 
 
 class LanguageModel(Module):
@@ -121,6 +151,8 @@ class LanguageModel(Module):
         ## default input config
         if input_config is None:
             input_config = {'n_vocab_in': n_vocab_in, 'bos': bos, 'd_model': d_model}
+        
+        self.input_config = input_config # if input_config is not None else {}
 
         # output_class
         if output_class is None:
@@ -138,9 +170,12 @@ class LanguageModel(Module):
         except:
             self.output_classcode = output_classcode
 
+
         ## default output config
         if output_config is None:
             output_config = {'n_vocab_out': n_vocab_out, 'd_model': d_model, 'n_layers': n_layers}
+
+        self.output_config = output_config # if output_config is not None else {}
 
         # layer_class
         if layer_class is None:
@@ -156,22 +191,37 @@ class LanguageModel(Module):
         except:
             self.layer_classcode = layer_classcode
             
-        self.text_input = input_class(**input_config)
-        self.layers = ModuleList(layer_class(**layer_config) for _ in range(self.n_layers))
-        self.text_output = output_class(**output_config)
+        self.layer_config = layer_config if layer_config is not None else {}
+
+        self.text_input = input_class(**self.input_config)
+        self.layers = ModuleList(layer_class(**self.layer_config) for _ in range(self.n_layers))
+        self.text_output = output_class(**self.output_config)
 
         if state_dict is not None:
             self.load_state_dict(state_dict)
-        
 
-    def add_layer(self, device=None):
-        if device is None:
-            try:
-                device = next(self.parameters()).device
-            except:
-                device = 'cpu'
-        self.layers.append(self.layer_class(**self.layer_config).to(device))
+    @property
+    def device(self):
+        try:
+            return next(self.parameters()).device
+        except:
+            return 'cpu'
+
+    def append_layer(self):
+        self.layers.append(self.layer_class(**self.layer_config).to(self.device))
+        params = list(self.layers[-1].parameters())
+        params += self.text_input.append_layer(**self.input_config)
+        params += self.text_output.append_layer(**self.output_config)
         self.n_layers += 1
+        return params
+    
+    def prepend_layer(self):
+        self.layers.insert(0, self.layer_class(**self.layer_config).to(self.device))
+        params = list(self.layers[0].parameters())
+        params += self.text_input.prepend_layer(**self.input_config)
+        params += self.text_output.prepend_layer(**self.output_config)
+        self.n_layers += 1
+        return params
 
     def forward(self, input_ids):
         """

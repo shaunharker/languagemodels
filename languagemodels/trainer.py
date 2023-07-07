@@ -62,9 +62,13 @@ class Trainer:
             if (layer_idx is None) or (idx == layer_idx):
                 group['lr'] = lr
     
-    def add_layer(self, **optim_args):
-        self.model.add_layer()
-        self.optimizer.add_param_group({'params': [list(self.model.text_output.parameters())[-1]], **optim_args})
+    def append_layer(self, **optim_args):
+        params = self.model.append_layer()
+        self.optimizer.add_param_group({'params': params, **optim_args})
+
+    def prepend_layer(self, **optim_args):
+        params = self.model.prepend_layer()
+        self.optimizer.add_param_group({'params': params, **optim_args})
 
     def save(self, path):
         checkpoint = {

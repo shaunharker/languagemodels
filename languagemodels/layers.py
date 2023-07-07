@@ -183,6 +183,8 @@ class ExperimentalLayer8(Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.proj = Linear(d_model, 2*d_model, bias=True)
+        self.proj.weight.data *= 0
+        self.proj.bias.data *= 0
 
     def forward(self, x): # 3 * d_model**2 * n_ctx + d_model * n_ctx ** 2
         device = x.device
