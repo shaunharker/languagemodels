@@ -42,7 +42,7 @@ class Trainer:
             'batch_multiplier': batch_multiplier
         }
 
-        self.dataset = FastPileBytesDataset(example_length=512)
+        self.dataset = FastPileBytesDataset(example_length=example_length)
         self.model = model.to('cuda')
         self.optimizer = CustomAdamW(
             [{'params': layer.parameters()} for layer in self.model.layers] +

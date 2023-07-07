@@ -11,17 +11,19 @@ from IPython.display import display, HTML
 import asyncio
 
 class TextInput(Module):
-    def __init__(self, n_vocab_in, d_model, bos=0):
+    def __init__(self, n_vocab_in, d_model, bos=0, **kwargs):
         super().__init__()
         self.bos = bos
+        self.n_vocab_in = n_vocab_in
         self.d_model = d_model
+        assert n_vocab_in <= d_model
 
     def forward(self, input_ids):
         return one_hot(pad(input_ids, (1, 0), "constant", self.bos), self.d_model).float()
 
 
 class TextOutput(Module):
-    def __init__(self, n_vocab_out, d_model):
+    def __init__(self, n_vocab_out, d_model, **kwargs):
         super().__init__()
         self.n_vocab_out = n_vocab_out
         self.d_model = d_model
@@ -32,34 +34,38 @@ class TextOutput(Module):
         return probs
     
 
-# class TextInput(Module):
-#     def __init__(self, n_vocab_in, d_model, bos=0):
-#         super().__init__()
-#         self.bos = bos
-#         self.embedding = Embedding(n_vocab_in, d_model)
+class TextInputEmbedding(Module):
+    def __init__(self, n_vocab_in, d_model, bos=0, **kwargs):
+        super().__init__()
+        self.bos = bos
+        self.embedding = Embedding(n_vocab_in, d_model)
 
-#     def forward(self, input_ids):
-#         padded_input_ids = pad(input_ids, (1, 0), "constant", self.bos)
-#         x = self.embedding(padded_input_ids)
-#         return x
+    def forward(self, input_ids):
+        padded_input_ids = pad(input_ids, (1, 0), "constant", self.bos)
+        x = self.embedding(padded_input_ids)
+        return x
 
 
-# class TextOutput(Module):
-#     def __init__(self, n_vocab_out, d_model, n_layers):
-#         super().__init__()
-#         self.n_vocab_out = n_vocab_out
-#         self.d_model = d_model
-#         self.read_heads = ModuleList(Linear(d_model, n_vocab_out, bias=False) for _ in range(n_layers))
+class TextOutputReadHeads(Module):
+    def __init__(self, n_vocab_out, d_model, n_layers, **kwargs):
+        super().__init__()
+        self.n_vocab_out = n_vocab_out
+        self.d_model = d_model
+        self.read_heads = ModuleList(Linear(d_model, n_vocab_out, bias=False) for _ in range(n_layers+1))
 
-#     def forward(self, x):
-#         # x.shape == (n_layers+1, batch_size, example_length, n_vocab_out)
-#         logits = torch.stack([self.read_heads[idx](x[idx]) for idx in range(x.shape[0])])
-#         probs = softmax(logits, dim=-1)
-#         return probs
+    def forward(self, x):
+        # x.shape == (n_layers+1, batch_size, example_length, n_vocab_out)
+        logits = torch.stack([self.read_heads[idx](x[idx]) for idx in range(x.shape[0])])
+        probs = softmax(logits, dim=-1)
+        return probs
     
-#     def add_layer(self):
-#         device = self.read_heads[0].weight.device
-#         self.read_heads.append(Linear(self.d_model, self.n_vocab_out, bias=False).to(device)) 
+    def add_layer(self, device=None):
+        if device is None:
+            try:
+                device = next(self.parameters()).device
+            except:
+                device = 'cpu'
+        self.read_heads.append(Linear(self.d_model, self.n_vocab_out, bias=False).to(device)) 
 
 
 class LanguageModel(Module):
@@ -69,15 +75,20 @@ class LanguageModel(Module):
                  bos=0,
                  d_model=1024,
                  n_layers=16,
+                 input_class=None,
+                 input_config=None,
+                 input_classname=None,
+                 input_classcode=None,
+                 output_class=None,
+                 output_config=None,
+                 output_classname=None,
+                 output_classcode=None,
                  layer_class=None,
                  layer_config=None,
                  layer_classname=None,
                  layer_classcode=None,
                  state_dict=None):
         super().__init__()
-        # self.text_input = TextInput(n_vocab_in=n_vocab_in, d_model=module.d_model, bos=bos)
-        # self.module = module
-        # self.text_output = TextOutput(n_vocab_out=n_vocab_out, d_model=module.d_model, n_layers=1+module.n_layers)
         self.n_vocab_in = n_vocab_in
         self.n_vocab_out = n_vocab_out
         self.bos = bos
@@ -86,12 +97,54 @@ class LanguageModel(Module):
         self.layer_class = layer_class
         self.layer_config = layer_config
 
-        if layer_class is None:
+        def load_class(code, classname):
             local_vars = {}
-            exec(layer_classcode, {'torch': torch, 'Module': Module, 'softmax': softmax, 'Linear': Linear}, local_vars)
-            layer_class = local_vars[layer_classname]
+            exec(code, {'torch': torch, 'Module': Module, 'softmax': softmax, 'Linear': Linear}, local_vars)
+            return local_vars[classname]
 
-        self.layer_class = layer_class
+        # input_class
+        if input_class is None:
+            try:
+                input_class = load_class(input_classcode, input_classname)
+            except:
+                input_class = TextInput
+        try:
+            self.input_classname = input_class.__name__
+        except:
+            self.input_classname = input_classname
+        
+        try:
+            self.input_classcode = inspect.getsource(self.input_class)
+        except:
+            self.input_classcode = input_classcode
+
+        ## default input config
+        if input_config is None:
+            input_config = {'n_vocab_in': n_vocab_in, 'bos': bos, 'd_model': d_model}
+
+        # output_class
+        if output_class is None:
+            try:
+                output_class = load_class(output_classcode, output_classname)
+            except:
+                output_class = TextOutput
+        try:
+            self.output_classname = output_class.__name__
+        except:
+            self.output_classname = output_classname
+        
+        try:
+            self.output_classcode = inspect.getsource(self.output_class)
+        except:
+            self.output_classcode = output_classcode
+
+        ## default output config
+        if output_config is None:
+            output_config = {'n_vocab_out': n_vocab_out, 'd_model': d_model, 'n_layers': n_layers}
+
+        # layer_class
+        if layer_class is None:
+            layer_class = load_class(layer_classcode, layer_classname)
 
         try:
             self.layer_classname = layer_class.__name__
@@ -103,17 +156,21 @@ class LanguageModel(Module):
         except:
             self.layer_classcode = layer_classcode
             
-        self.text_input = TextInput(n_vocab_in=n_vocab_in, d_model=d_model, bos=bos)
+        self.text_input = input_class(**input_config)
         self.layers = ModuleList(layer_class(**layer_config) for _ in range(self.n_layers))
-        self.text_output = TextOutput(n_vocab_out=n_vocab_out, d_model=d_model)
+        self.text_output = output_class(**output_config)
 
         if state_dict is not None:
             self.load_state_dict(state_dict)
         
 
-    def add_layer(self):
-        device = self.device
-        self.layers.append(self.layer_class(**self.config).to(device))
+    def add_layer(self, device=None):
+        if device is None:
+            try:
+                device = next(self.parameters()).device
+            except:
+                device = 'cpu'
+        self.layers.append(self.layer_class(**self.layer_config).to(device))
         self.n_layers += 1
 
     def forward(self, input_ids):
@@ -142,6 +199,10 @@ class LanguageModel(Module):
                 'bos': self.bos,
                 'd_model': self.d_model,
                 'n_layers': self.n_layers,
+                'input_classname': self.input_classname,
+                'input_classcode': self.input_classcode,
+                'output_classname': self.output_classname,
+                'output_classcode': self.output_classcode,
                 'layer_config': self.layer_config,
                 'layer_classname': self.layer_classname,
                 'layer_classcode': self.layer_classcode}
@@ -165,7 +226,7 @@ English."""
             n_ctx = 512
         input_ids = input_ids[-n_ctx:]
         prompt = decoder(input_ids)
-        device='cuda'
+        device = next(self.parameters()).device
         async def sampler(input_ids):
             for _ in range(n_generate):
                 await asyncio.sleep(0)  # Give other tasks a chance to run

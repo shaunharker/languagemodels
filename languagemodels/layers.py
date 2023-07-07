@@ -43,7 +43,7 @@ class MultiHeadAttentionLayer(Module):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
-        self.proj = Linear(d_model, 3*d_model, bias=False)
+        self.proj = Linear(d_model, 3*d_model, bias=True)
 
     def forward(self, x):
         device = x.device
@@ -57,6 +57,25 @@ class MultiHeadAttentionLayer(Module):
         return x
 
 
+class ExperimentalLayer1(Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.proj = Linear(d_model, 3*d_model, bias=False)
+
+    def forward(self, x):
+        device = x.device
+        n_ctx = x.shape[-2]
+        split_heads = lambda x: x.view(x.shape[:-1] + (self.n_heads, -1)).transpose(-2, -3).contiguous()
+        merge_heads = lambda x: x.transpose(-2, -3).contiguous().view(x.shape[:-3] + (n_ctx, -1))
+        Q, K, V = map(split_heads, torch.split(self.proj(x), self.d_model, dim=-1))
+        mask = (1 - 1 / torch.tril(torch.ones((n_ctx, n_ctx), device=device)))
+        QKT = torch.matmul(Q, K.transpose(-1, -2)) + mask
+        x = x + merge_heads(softmax(QKT, dim=-1) @ V)
+        return x
+    
+
 class ExperimentalLayer2(Module):
     def __init__(self, d_model, n_heads):
         super().__init__()
@@ -64,7 +83,7 @@ class ExperimentalLayer2(Module):
         self.n_heads = n_heads
         self.proj = Linear(d_model, 2*d_model, bias=False)
 
-    def forward(self, x):
+    def forward(self, x): # 3 * d_model**2 * n_ctx + d_model * n_ctx ** 2
         device = x.device
         n_ctx = x.shape[-2]
         split_heads = lambda x: x.view(x.shape[:-1] + (self.n_heads, -1)).transpose(-2, -3).contiguous()
@@ -156,4 +175,22 @@ class ExperimentalLayer7(Module):
         mask = (1 - 1 / torch.tril(torch.ones((n_ctx, n_ctx), device=device)))
         QKT = torch.matmul(x, K.transpose(-1, -2)) + mask
         x = x + (softmax(QKT, dim=-1) @ V)
+        return x
+
+class ExperimentalLayer8(Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.proj = Linear(d_model, 2*d_model, bias=True)
+
+    def forward(self, x): # 3 * d_model**2 * n_ctx + d_model * n_ctx ** 2
+        device = x.device
+        n_ctx = x.shape[-2]
+        split_heads = lambda x: x.view(x.shape[:-1] + (self.n_heads, -1)).transpose(-2, -3).contiguous()
+        merge_heads = lambda x: x.transpose(-2, -3).contiguous().view(x.shape[:-3] + (n_ctx, -1))
+        Q, K, V = map(split_heads, (x,) + torch.split(self.proj(x), self.d_model, dim=-1))
+        mask = (1 - 1 / torch.tril(torch.ones((n_ctx, n_ctx), device=device)))
+        QKT = torch.matmul(Q, K.transpose(-1, -2)) + mask
+        x = x + merge_heads(softmax(QKT, dim=-1) @ V)
         return x
