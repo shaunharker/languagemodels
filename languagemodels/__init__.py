@@ -8,4 +8,4 @@ from .model import TextInput, TextOutput, LanguageModel
 from .dataset import utf8decode, utf8encode, utf8bitsdecode, utf8bitsencode, FastPileBytesDataset
 from .optimizer import CustomAdamW
 from .trainer import Trainer
-from .layers import TransformerLayer, MultiHeadAttentionLayer
+from .layers import TransformerLayer, MultiHeadAttentionLayer, ExperimentalLayer2, ExperimentalLayer3, ExperimentalLayer4, ExperimentalLayer5, ExperimentalLayer6, ExperimentalLayer7
