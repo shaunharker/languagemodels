@@ -39,11 +39,13 @@ class TransformerLayer(Module):
 
 
 class MultiHeadAttentionLayer(Module):
-    def __init__(self, d_model, n_heads):
+    def __init__(self, d_model, n_heads, init_scale=1.0):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         self.proj = Linear(d_model, 3*d_model, bias=True)
+        self.proj.weight.data *= init_scale
+        self.proj.bias.data *= init_scale
 
     def forward(self, x):
         device = x.device
@@ -82,6 +84,7 @@ class ExperimentalLayer2(Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.proj = Linear(d_model, 2*d_model, bias=False)
+        self.proj.weight.data *= 0
 
     def forward(self, x): # 3 * d_model**2 * n_ctx + d_model * n_ctx ** 2
         device = x.device
@@ -101,6 +104,7 @@ class ExperimentalLayer3(Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.proj = Linear(d_model, d_model, bias=False)
+        self.proj.weight.data *= 0
 
     def forward(self, x):
         device = x.device
@@ -121,6 +125,7 @@ class ExperimentalLayer4(Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.proj = Linear(d_model, d_model, bias=False)
+        self.proj.weight.data *= 0
 
     def forward(self, x):
         device = x.device
@@ -139,6 +144,7 @@ class ExperimentalLayer5(Module):
         super().__init__()
         self.d_model = d_model
         self.proj = Linear(d_model, d_model, bias=False)
+        self.proj.weight.data *= 0
 
     def forward(self, x):
         n_ctx = x.shape[-2]
@@ -152,6 +158,7 @@ class ExperimentalLayer6(Module):
         super().__init__()
         self.d_model = d_model
         self.proj = Linear(d_model, 3*d_model, bias=False)
+        self.proj.weight.data *= 0
 
     def forward(self, x):
         device = x.device
@@ -167,6 +174,7 @@ class ExperimentalLayer7(Module):
         super().__init__()
         self.d_model = d_model
         self.proj = Linear(d_model, 2*d_model, bias=False)
+        self.proj.weight.data *= 0
 
     def forward(self, x):
         device = x.device
@@ -195,4 +203,26 @@ class ExperimentalLayer8(Module):
         mask = (1 - 1 / torch.tril(torch.ones((n_ctx, n_ctx), device=device)))
         QKT = torch.matmul(Q, K.transpose(-1, -2)) + mask
         x = x + merge_heads(softmax(QKT, dim=-1) @ V)
+        return x
+    
+class ExperimentalLayer9(Module):
+    def __init__(self, d_model, n_heads, d_hidden):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_hidden = d_hidden
+        self.key_proj = Linear(d_model, d_model, bias=True)
+        self.value_proj = Linear(d_model, d_hidden, bias=True)
+        self.nonlinearity = GELU()
+        self.ff = Linear(d_hidden, d_model, bias=True)
+
+    def forward(self, x): # 3 * d_model**2 * n_ctx + d_model * n_ctx ** 2
+        device = x.device
+        n_ctx = x.shape[-2]
+        split_heads = lambda x: x.view(x.shape[:-1] + (self.n_heads, -1)).transpose(-2, -3).contiguous()
+        merge_heads = lambda x: x.transpose(-2, -3).contiguous().view(x.shape[:-3] + (n_ctx, -1))
+        Q, K, V = map(split_heads, (x, self.key_proj(x), self.value_proj(x)))
+        mask = (1 - 1 / torch.tril(torch.ones((n_ctx, n_ctx), device=device)))
+        QKT = torch.matmul(Q, K.transpose(-1, -2)) + mask
+        x = x + self.ff(self.nonlinearity(merge_heads(softmax(QKT, dim=-1) @ V)))
         return x

@@ -9,6 +9,7 @@ from .dataset import utf8decode, utf8encode
 import inspect
 from IPython.display import display, HTML
 import asyncio
+from torch.utils.checkpoint import checkpoint
 
 class TextInput(Module):
     def __init__(self, n_vocab_in, d_model, bos=0, **kwargs):
@@ -63,14 +64,41 @@ class TextInputEmbedding(Module):
     def prepend_layer(self, **kwargs):
         return []
 
+
+class TextInputAutoregressive(Module):
+    def __init__(self, n_vocab_in, d_model, bos=0, bias=False, init_scale=0.0):
+        super().__init__()
+        self.bos = bos
+        self.embedding = Embedding(n_vocab_in, d_model)
+        self.M = Linear(d_model, d_model, bias=bias)
+        self.M.weight.data *= init_scale
+
+    def forward(self, input_ids):
+        padded_input_ids = pad(input_ids, (1, 0), "constant", self.bos)
+        x = self.embedding(padded_input_ids)
+        ys = [x[...,0,:]]
+        for idx in range(1, x.shape[-2]):
+            ys += [self.M(ys[-1]) + x[...,idx,:]]
+        return torch.stack(ys, dim=-2)
+
+    def append_layer(self, **kwargs):
+        return []
+
+    def prepend_layer(self, **kwargs):
+        return []
+    
+
 class TextOutputReadHeads(Module):
-    def __init__(self, n_vocab_out, d_model, n_layers, init_scale=0.0):
+    def __init__(self, n_vocab_out, d_model, n_layers, bias=True, init_scale=0.0):
         super().__init__()
         self.n_vocab_out = n_vocab_out
         self.d_model = d_model
-        self.read_heads = ModuleList(Linear(d_model, n_vocab_out, bias=False) for _ in range(n_layers+1))
+        self.bias = bias
+        self.read_heads = ModuleList(Linear(d_model, n_vocab_out, bias=self.bias) for _ in range(n_layers+1))
         for read_head in self.read_heads:
             read_head.weight.data *= init_scale
+            if self.bias:
+                read_head.bias.data *= init_scale
 
     def forward(self, x):
         # x.shape == (n_layers+1, batch_size, example_length, n_vocab_out)
@@ -86,14 +114,18 @@ class TextOutputReadHeads(Module):
             return 'cpu'
         
     def append_layer(self, **kwargs):
-        layer = Linear(self.d_model, self.n_vocab_out, bias=False).to(self.device)
+        layer = Linear(self.d_model, self.n_vocab_out, bias=self.bias).to(self.device)
         layer.weight.data.copy_(self.read_heads[-1].weight.data)
+        if self.bias:
+            layer.bias.data.copy_(self.read_heads[-1].bias.data)
         self.read_heads.append(layer)
         return list(self.read_heads[-1].parameters())
 
     def prepend_layer(self, **kwargs):
-        layer = Linear(self.d_model, self.n_vocab_out, bias=False).to(self.device)
+        layer = Linear(self.d_model, self.n_vocab_out, bias=self.bias).to(self.device)
         layer.weight.data.copy_(self.read_heads[0].weight.data)
+        if self.bias:
+            layer.bias.data.copy_(self.read_heads[0].bias.data)
         self.read_heads.insert(0, layer)
         return list(self.read_heads[0].parameters())
 
@@ -117,19 +149,25 @@ class LanguageModel(Module):
                  layer_config=None,
                  layer_classname=None,
                  layer_classcode=None,
-                 state_dict=None):
+                 checkpointing=True):
         super().__init__()
         self.n_vocab_in = n_vocab_in
         self.n_vocab_out = n_vocab_out
         self.bos = bos
         self.d_model = d_model
         self.n_layers = n_layers
-        self.layer_class = layer_class
-        self.layer_config = layer_config
+        self.checkpointing = checkpointing
 
         def load_class(code, classname):
             local_vars = {}
-            exec(code, {'torch': torch, 'Module': Module, 'softmax': softmax, 'Linear': Linear}, local_vars)
+            exec(code, {'torch': torch,
+                        'Module': Module,
+                        'ModuleList': ModuleList,
+                        'Linear': Linear,
+                        'Embedding': Embedding,
+                        'pad': pad,
+                        'softmax': softmax,
+                        'one_hot': one_hot}, local_vars)
             return local_vars[classname]
 
         # input_class
@@ -144,9 +182,11 @@ class LanguageModel(Module):
             self.input_classname = input_classname
         
         try:
-            self.input_classcode = inspect.getsource(self.input_class)
+            self.input_classcode = inspect.getsource(input_class)
         except:
             self.input_classcode = input_classcode
+
+        self.input_class = input_class
 
         ## default input config
         if input_config is None:
@@ -166,10 +206,11 @@ class LanguageModel(Module):
             self.output_classname = output_classname
         
         try:
-            self.output_classcode = inspect.getsource(self.output_class)
+            self.output_classcode = inspect.getsource(output_class)
         except:
             self.output_classcode = output_classcode
 
+        self.output_class = output_class
 
         ## default output config
         if output_config is None:
@@ -180,6 +221,8 @@ class LanguageModel(Module):
         # layer_class
         if layer_class is None:
             layer_class = load_class(layer_classcode, layer_classname)
+
+        self.layer_class = layer_class
 
         try:
             self.layer_classname = layer_class.__name__
@@ -192,13 +235,11 @@ class LanguageModel(Module):
             self.layer_classcode = layer_classcode
             
         self.layer_config = layer_config if layer_config is not None else {}
-
+        
         self.text_input = input_class(**self.input_config)
         self.layers = ModuleList(layer_class(**self.layer_config) for _ in range(self.n_layers))
         self.text_output = output_class(**self.output_config)
 
-        if state_dict is not None:
-            self.load_state_dict(state_dict)
 
     @property
     def device(self):
@@ -230,7 +271,10 @@ class LanguageModel(Module):
         x = self.text_input(input_ids)
         xs = [x]
         for layer in self.layers:
-            x = layer(x)
+            if self.checkpointing:
+                x = checkpoint(layer, x)
+            else:
+                x = layer(x)
             xs.append(x)
         xs = torch.stack(xs, dim=0)
         probs = self.text_output(xs) # (n_layers+1, batch_size, example_length, n_vocab_out)
@@ -240,22 +284,25 @@ class LanguageModel(Module):
         input_ids = output_ids[...,:-1]
         probs = self.forward(input_ids) # (n_layers+1, batch_size, example_length, n_vocab_out)
         output_ids = torch.stack([output_ids] * probs.shape[0]).unsqueeze(-1) # (n_layers+1, batch_size, example_length, 1) uint8_t data (torch.long storage)
-        return -torch.gather(probs, dim=-1, index=output_ids).log2() # cross entropy samples
+        return -torch.gather(probs, dim=-1, index=output_ids).squeeze(-1).log2() # cross entropy samples
 
     def serialize(self):
         return {'state_dict': self.state_dict(),
-                'n_vocab_in': self.n_vocab_in,
-                'n_vocab_out': self.n_vocab_out,
-                'bos': self.bos,
-                'd_model': self.d_model,
-                'n_layers': self.n_layers,
-                'input_classname': self.input_classname,
-                'input_classcode': self.input_classcode,
-                'output_classname': self.output_classname,
-                'output_classcode': self.output_classcode,
-                'layer_config': self.layer_config,
-                'layer_classname': self.layer_classname,
-                'layer_classcode': self.layer_classcode}
+                'config': {
+                    'n_vocab_in': self.n_vocab_in,
+                    'n_vocab_out': self.n_vocab_out,
+                    'bos': self.bos,
+                    'd_model': self.d_model,
+                    'n_layers': self.n_layers,
+                    'input_config': self.input_config,
+                    'input_classname': self.input_classname,
+                    'input_classcode': self.input_classcode,
+                    'output_config': self.output_config,
+                    'output_classname': self.output_classname,
+                    'output_classcode': self.output_classcode,
+                    'layer_config': self.layer_config,
+                    'layer_classname': self.layer_classname,
+                    'layer_classcode': self.layer_classcode}}
 
     def autocomplete(self,
                      prompt=None,

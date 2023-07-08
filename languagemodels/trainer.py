@@ -65,10 +65,13 @@ class Trainer:
     def append_layer(self, **optim_args):
         params = self.model.append_layer()
         self.optimizer.add_param_group({'params': params, **optim_args})
+        self.loss_by_layer = [np.concatenate((x, [x[-1]])) for x in self.loss_by_layer]
+
 
     def prepend_layer(self, **optim_args):
         params = self.model.prepend_layer()
         self.optimizer.add_param_group({'params': params, **optim_args})
+        self.loss_by_layer = [np.concatenate(([x[0]], x)) for x in self.loss_by_layer]
 
     def save(self, path):
         checkpoint = {
@@ -85,7 +88,8 @@ class Trainer:
     @classmethod
     def load(cls, path):
         checkpoint = torch.load(path)
-        model = LanguageModel(**checkpoint['model'])
+        model = LanguageModel(**checkpoint['model']['config'])
+        model.load_state_dict(checkpoint['model']['state_dict'])
         trainer = cls(**checkpoint['config'], model=model)
         trainer.loss_by_layer = checkpoint['loss_by_layer']
         trainer.last_layer_loss = checkpoint['last_layer_loss']
@@ -103,6 +107,39 @@ class Trainer:
         self.n = 0
         self.D = 0 # total data
 
+    def condense_data(self):
+
+        # courtesy GPT-4 with a bit of prodding:
+        def avg_every_other(arr, axis):
+            # Determine size of the axis
+            size = arr.shape[axis]
+            pair_num = size // 2
+
+            # Split the array into main part and possible leftover
+            main_part = np.swapaxes(arr, axis, -1)[..., :pair_num*2]
+            leftover = np.swapaxes(arr, axis, -1)[..., pair_num*2:]
+
+            # Reshape the main part for averaging
+            reshaped = main_part.reshape(*main_part.shape[:-1], -1, 2)
+
+            # Calculate the average and concatenate the leftover if exists
+            averaged = reshaped.mean(axis=-1)
+            if size % 2 == 1:  # if size along the axis is odd
+                result = np.concatenate([averaged, leftover], axis=-1)
+            else:
+                result = averaged
+
+            return np.swapaxes(result, -1, axis)
+        
+        def condense(list_of_arr):
+            avged = avg_every_other(np.stack(list_of_arr), axis=0)
+            return [np.squeeze(x, axis=0) for x in np.split(avged, len(avged))]
+
+        self.loss_by_layer = condense(self.loss_by_layer)
+        self.last_layer_loss = condense(self.last_layer_loss)
+        self.times = condense(self.times)
+
+        
     def time_repair(self, gap=10.0):
         """
         Aligns time-stamps with present (bringings into future) by
@@ -127,17 +164,24 @@ class Trainer:
         delta = time.time() - self.times[-1] 
         self.times = [t + delta for t in self.times]
 
+    def batch(self, batch_size=None, example_length=None):
+        if batch_size is None:
+            batch_size = self.config['batch_size']
+        if example_length is None:
+            example_length = self.config['example_length']        
+        if len(self.inbox) > 0:
+            batch = self.inbox.pop()
+        else:
+            batch = self.dataset.batch(batch_size=batch_size, example_length=example_length)
+        return batch
+            
     def train(self):
         # read config
         batch_size = self.config['batch_size']
         example_length = self.config['example_length']
 
-        # get batch of training examples
-        if len(self.inbox) > 0:
-            batch = self.inbox.pop()
-        else:
-            batch = self.dataset.batch(batch_size=batch_size,
-                                       example_length=example_length)
+        # get batch
+        batch = self.batch(batch_size, example_length)
         
         # perform forward pass
         losses = self.model.losses(batch)
