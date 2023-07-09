@@ -3,7 +3,7 @@
 # License: MIT
 
 import torch
-from torch.nn import Module, Linear, Embedding, ModuleList
+from torch.nn import Module, Linear, Embedding, ModuleList, GELU, LayerNorm
 from torch.nn.functional import pad, softmax, one_hot
 from .dataset import utf8decode, utf8encode
 import inspect
@@ -64,6 +64,30 @@ class TextInputEmbedding(Module):
     def prepend_layer(self, **kwargs):
         return []
 
+class TextInputMultipleEmbedding(Module):
+    def __init__(self, n_vocab_in, d_embd, d_model, bos=0, init_scale=1.0):
+        super().__init__()
+        self.bos = bos
+        self.embedding = Embedding(n_vocab_in, d_embd)
+        self.embedding.weight.data *= init_scale
+        self.lookback = d_model // d_embd 
+
+    def forward(self, input_ids):
+        padded_input_ids = pad(input_ids, (1, 0), "constant", self.bos)
+        xs = []
+        xs.append(self.embedding(padded_input_ids))
+        for _ in range(self.lookback-1):
+            xs.append(torch.roll(xs[-1], shifts=1, dims=-2))
+            xs[-1][...,0,:] = xs[-1][...,1,:] # copy bos embedding
+        return torch.cat(xs, dim=-1)
+    
+    def append_layer(self, **kwargs):
+        return []
+
+    def prepend_layer(self, **kwargs):
+        return []
+    
+
 
 class TextInputAutoregressive(Module):
     def __init__(self, n_vocab_in, d_model, bos=0, bias=False, init_scale=0.0):
@@ -89,7 +113,7 @@ class TextInputAutoregressive(Module):
     
 
 class TextOutputReadHeads(Module):
-    def __init__(self, n_vocab_out, d_model, n_layers, bias=True, init_scale=0.0):
+    def __init__(self, n_vocab_out, d_model, n_layers, bias=True, init_scale=1.0):
         super().__init__()
         self.n_vocab_out = n_vocab_out
         self.d_model = d_model
@@ -165,6 +189,8 @@ class LanguageModel(Module):
                         'ModuleList': ModuleList,
                         'Linear': Linear,
                         'Embedding': Embedding,
+                        'LayerNorm': LayerNorm,
+                        'GELU': GELU,
                         'pad': pad,
                         'softmax': softmax,
                         'one_hot': one_hot}, local_vars)
@@ -280,6 +306,35 @@ class LanguageModel(Module):
         probs = self.text_output(xs) # (n_layers+1, batch_size, example_length, n_vocab_out)
         return probs
     
+    @torch.no_grad()
+    def generate(self, input_ids=None, generation_data=None, output_layer=-1, temp=1.0):
+        ## TODO: maybe this all folds into forward in a way that makes code much smaller.
+        ##       for now, keep it long and stupid, for debugging.
+        ## todo: output_layer lower could give faster inference with some changes
+        ## todo: batched version  (maybe works?)
+        ## todo: fix DRY issues
+        if input_ids is None:
+            device = next(self.parameters()).device
+            input_ids = torch.tensor([], torch.long).to(device).view(1,0)
+        if generation_data is None:
+            generation_data = [[] for _ in range(self.n_layers)]  # not the same as [[]]*self.n_layers, which gives SAME list.
+
+        x = self.text_input(input_ids)
+        x = x[...,len(generation_data[0]):,:]
+
+        xs = [x]
+        for layer, layer_data in zip(self.layers, generation_data):
+            x = layer(x, layer_data=layer_data)
+            xs.append(x)
+        xs = torch.stack(xs, dim=0)
+        probs = self.text_output(xs)[output_layer,:,-1,:] # (n_layers+1, batch_size, example_length, n_vocab_out)
+        if temp > 0:
+            y = torch.distributions.Categorical(probs=probs**(1.0/temp)).sample().unsqueeze(-1)
+        else:
+            y = torch.argmax(probs, keepdim=True)
+        return torch.cat((input_ids, y), dim=-1), generation_data
+
+
     def losses(self, output_ids):
         input_ids = output_ids[...,:-1]
         probs = self.forward(input_ids) # (n_layers+1, batch_size, example_length, n_vocab_out)
@@ -318,24 +373,23 @@ class LanguageModel(Module):
 remote, previously unexplored valley in the Andes Mountains. Even more
 surprising to the researchers was the fact that the unicorns spoke perfect
 English."""
-        input_ids = encoder(prompt)
-        if n_ctx is None:
-            n_ctx = 512
-        input_ids = input_ids[-n_ctx:]
-        prompt = decoder(input_ids)
         device = next(self.parameters()).device
-        async def sampler(input_ids):
-            for _ in range(n_generate):
-                await asyncio.sleep(0)  # Give other tasks a chance to run
-                probs = self(torch.tensor(input_ids, dtype=torch.long, device=device).unsqueeze(0))[output_layer].view(-1)[-self.n_vocab_out:]
-                if temp > 0:
-                    y = Categorical(probs=probs**(1.0/temp)).sample().item()
-                else:
-                    y = torch.argmax(probs).item()
-                input_ids = (input_ids + [y])[-n_ctx:]
-                yield y
+        input_ids = torch.tensor([c for c in encoder(prompt)], dtype=torch.long, device=device).unsqueeze(0)
+        if n_ctx is not None:
+            input_ids = input_ids[...,-n_ctx:]
+        
+        async def sampler(input_ids):            
+            generation_data = [[] for _ in range(self.n_layers)]
+            for idx in range(n_generate):
+                if idx % 16 == 0:
+                    await asyncio.sleep(0)  # Give other tasks a chance to run
+                input_ids, generation_data = self.generate(input_ids=input_ids, generation_data=generation_data, output_layer=output_layer, temp=temp)
+                if n_ctx is not None:
+                    input_ids = input_ids[...,-n_ctx:]
+                    generation_data = [layer_data[-n_ctx:] for layer_data in generation_data] ## todo, why not use a tensor? lists of lists was premature optimization, i think
+                yield input_ids
 
-        return sampler(list(input_ids))
+        return sampler(input_ids)
     
     async def display_autocomplete(self,
                      prompt=None,
@@ -350,12 +404,14 @@ English."""
                                     encoder=encoder, decoder=decoder, output_layer=output_layer)
         display_handle = display(HTML(prompt), display_id=True)
         list_of_tokens = []
-        async for c in sampler:
+        async for input_ids in sampler:
+            c = input_ids.view(-1)[-1]
             list_of_tokens.append(c)
             completion = decoder(list_of_tokens)
+            n_lines = prompt.count("\n") + completion.count("\n")
             def cleanup(s):
                 return s.replace('<', '&lt;').replace('>', '&gt;')
             contents = ('<pre style="background: black; color: lime; font-family: monospace">'+
-                    '<span style="color: white">' + cleanup(prompt) + '</span>' + cleanup(completion) + '\n'*20 + '</pre>')
+                    '<span style="color: white">' + cleanup(prompt) + '</span>' + cleanup(completion) + '\n'*max(1, 20-n_lines) + '</pre>')
             display_handle.update(HTML(contents))
         return display_handle
