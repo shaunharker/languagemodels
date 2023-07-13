@@ -22,6 +22,9 @@ class TextInput(Module):
     def forward(self, input_ids):
         return one_hot(pad(input_ids, (1, 0), "constant", self.bos), self.d_model).float()
 
+    def insert_layer(self, index, **kwargs):
+        return []
+    
     def append_layer(self, **kwargs):
         return []
 
@@ -38,6 +41,9 @@ class TextOutput(Module):
         logits = x[..., -self.n_vocab_out:]
         probs = softmax(logits, dim=-1)
         return probs
+    
+    def insert_layer(self, index, **kwargs):
+        return []
     
     def append_layer(self, **kwargs):
         return []
@@ -58,11 +64,15 @@ class TextInputEmbedding(Module):
         x = self.embedding(padded_input_ids)
         return x
 
+    def insert_layer(self, index, **kwargs):
+        return []
+    
     def append_layer(self, **kwargs):
         return []
 
     def prepend_layer(self, **kwargs):
         return []
+
 
 class TextInputMultipleEmbedding(Module):
     def __init__(self, n_vocab_in, d_embd, d_model, bos=0, init_scale=1.0):
@@ -81,14 +91,16 @@ class TextInputMultipleEmbedding(Module):
             xs[-1][...,0,:] = xs[-1][...,1,:] # copy bos embedding
         return torch.cat(xs, dim=-1)
     
+    def insert_layer(self, index, **kwargs):
+        return []
+    
     def append_layer(self, **kwargs):
         return []
 
     def prepend_layer(self, **kwargs):
         return []
+
     
-
-
 class TextInputAutoregressive(Module):
     def __init__(self, n_vocab_in, d_model, bos=0, bias=False, init_scale=0.0):
         super().__init__()
@@ -105,12 +117,15 @@ class TextInputAutoregressive(Module):
             ys += [self.M(ys[-1]) + x[...,idx,:]]
         return torch.stack(ys, dim=-2)
 
+    def insert_layer(self, index, **kwargs):
+        return []
+    
     def append_layer(self, **kwargs):
         return []
 
     def prepend_layer(self, **kwargs):
         return []
-    
+
 
 class TextOutputReadHeads(Module):
     def __init__(self, n_vocab_out, d_model, n_layers, bias=True, init_scale=1.0):
@@ -137,21 +152,21 @@ class TextOutputReadHeads(Module):
         except:
             return 'cpu'
         
+    def insert_layer(self, index, **kwargs):
+        # note: off by 1 due to embedding layer, treat read_heads as if starting from 1 (though copy embedding layer read head)
+        layer = Linear(self.d_model, self.n_vocab_out, bias=self.bias).to(self.device)
+        layer.weight.data.copy_(self.read_heads[index].weight.data)
+        if self.bias:
+            layer.bias.data.copy_(self.read_heads[index].bias.data)
+        self.read_heads.insert(index=index+1, module=layer)
+        return list(self.read_heads[index+1].parameters())
+    
     def append_layer(self, **kwargs):
-        layer = Linear(self.d_model, self.n_vocab_out, bias=self.bias).to(self.device)
-        layer.weight.data.copy_(self.read_heads[-1].weight.data)
-        if self.bias:
-            layer.bias.data.copy_(self.read_heads[-1].bias.data)
-        self.read_heads.append(layer)
-        return list(self.read_heads[-1].parameters())
-
+        n_layers = len(self.read_heads)-1
+        return self.insert_layer(index=n_layers)
+    
     def prepend_layer(self, **kwargs):
-        layer = Linear(self.d_model, self.n_vocab_out, bias=self.bias).to(self.device)
-        layer.weight.data.copy_(self.read_heads[0].weight.data)
-        if self.bias:
-            layer.bias.data.copy_(self.read_heads[0].bias.data)
-        self.read_heads.insert(0, layer)
-        return list(self.read_heads[0].parameters())
+        return self.insert_layer(index=0)
 
 
 class LanguageModel(Module):
@@ -173,7 +188,7 @@ class LanguageModel(Module):
                  layer_config=None,
                  layer_classname=None,
                  layer_classcode=None,
-                 checkpointing=True):
+                 checkpointing=False):
         super().__init__()
         self.n_vocab_in = n_vocab_in
         self.n_vocab_out = n_vocab_out
@@ -266,7 +281,6 @@ class LanguageModel(Module):
         self.layers = ModuleList(layer_class(**self.layer_config) for _ in range(self.n_layers))
         self.text_output = output_class(**self.output_config)
 
-
     @property
     def device(self):
         try:
@@ -274,21 +288,22 @@ class LanguageModel(Module):
         except:
             return 'cpu'
 
-    def append_layer(self):
-        self.layers.append(self.layer_class(**self.layer_config).to(self.device))
-        params = list(self.layers[-1].parameters())
-        params += self.text_input.append_layer(**self.input_config)
-        params += self.text_output.append_layer(**self.output_config)
+    def insert_layer(self, index):
+        self.layers.insert(index, self.layer_class(**self.layer_config).to(self.device))
+        params = list(self.layers[index].parameters())
+        params += self.text_input.insert_layer(index)
+        params += self.text_output.insert_layer(index)
         self.n_layers += 1
+        if 'n_layers' in self.output_config:
+            self.output_config['n_layers'] += 1
+            # TODO refactor how I handle configs for appending, serialization, extensibility considerations
         return params
     
+    def append_layer(self):
+        return self.insert_layer(index=self.n_layers)
+    
     def prepend_layer(self):
-        self.layers.insert(0, self.layer_class(**self.layer_config).to(self.device))
-        params = list(self.layers[0].parameters())
-        params += self.text_input.prepend_layer(**self.input_config)
-        params += self.text_output.prepend_layer(**self.output_config)
-        self.n_layers += 1
-        return params
+        return self.insert_layer(index=0)
 
     def forward(self, input_ids):
         """
@@ -320,14 +335,18 @@ class LanguageModel(Module):
             generation_data = [[] for _ in range(self.n_layers)]  # not the same as [[]]*self.n_layers, which gives SAME list.
 
         x = self.text_input(input_ids)
-        x = x[...,len(generation_data[0]):,:]
 
-        xs = [x]
-        for layer, layer_data in zip(self.layers, generation_data):
-            x = layer(x, layer_data=layer_data)
-            xs.append(x)
-        xs = torch.stack(xs, dim=0)
-        probs = self.text_output(xs)[output_layer,:,-1,:] # (n_layers+1, batch_size, example_length, n_vocab_out)
+        if self.n_layers > 0:
+            x = x[...,len(generation_data[0]):,:]
+            xs = [x]
+            for layer, layer_data in zip(self.layers, generation_data):
+                x = layer(x, layer_data=layer_data)
+                xs.append(x)
+            xs = torch.stack(xs, dim=0)
+            probs = self.text_output(xs)[output_layer,:,-1,:] # (n_layers+1, batch_size, example_length, n_vocab_out)
+        else:
+            probs = self.text_output(x.unsqueeze(0))[0,:,-1,:] # (n_layers+1, batch_size, example_length, n_vocab_out)
+
         if temp > 0:
             y = torch.distributions.Categorical(probs=probs**(1.0/temp)).sample().unsqueeze(-1)
         else:

@@ -57,6 +57,23 @@ class TransformerLayer(Module):
 
         return x
 
+class PersephoneLayer(Module):
+    def __init__(self, d_model, d_k, init_scale=1.0):
+        super().__init__()
+        self.ln = LayerNorm(d_model)
+        self.proj = Linear(d_model, d_k, bias=True)
+
+    def forward(self, x, layer_data=None):
+        self.proj(x)
+        # idea. everybody makes a key. then we sum the keys from our d_model//d_k predecessors.
+        # we could use FTC: 
+        #   F(b)-F(a) = sum f(i), which lets us do cumsum differences.
+        #   However, I worry about "subtraction of close numbers" issues with numerics.
+        #   A sequential iterative approach is more precise, but it is slow.
+
+        x = x + self.ln(x)
+        return x
+    
 
 class MultiHeadAttentionLayer(Module):
     def __init__(self, d_model, n_heads, init_scale=1.0):

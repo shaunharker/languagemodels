@@ -7,6 +7,9 @@ import time
 import asyncio
 import numpy as np
 from IPython.display import display, HTML
+import re
+import collections
+import string
 
 from .dataset import FastPileBytesDataset
 from .model import LanguageModel
@@ -15,6 +18,26 @@ from .optimizer import CustomAdamW
 import torch
 from torch.nn import Module, Linear, LayerNorm, GELU
 from torch.nn.functional import softmax
+
+
+class MeanAndDriftEstimator:
+    def __init__(self, decay_rates=[.99, .999]):
+        self.decay_rates = np.array(decay_rates)
+        self.loss_emas = np.zeros_like(decay_rates)
+        self.time_emas = np.zeros_like(decay_rates)
+        self.n = 0
+
+    def __call__(self, loss, time):
+        self.loss_emas = self.decay_rates * self.loss_emas + (1 - self.decay_rates) * loss
+        self.time_emas = self.decay_rates * self.time_emas + (1 - self.decay_rates) * time
+        self.n += 1
+
+    def get_stats(self):
+        delta_loss = self.loss_emas[1] - self.loss_emas[0]
+        delta_time = self.time_emas[1] - self.time_emas[0]
+        rate_of_change = delta_loss / delta_time if delta_time != 0 else 0
+        return self.n, self.loss_emas, self.time_emas, rate_of_change
+    
 
 class Trainer:
     def __init__(self,
@@ -57,21 +80,28 @@ class Trainer:
         self.n = 0
         self.D = 0 # total data
 
+        punctuation = string.punctuation
+        escaped_punctuation = [re.escape(p) for p in punctuation]
+        punctuation_regex = b"|".join(p.encode() for p in escaped_punctuation)
+        self.pattern = re.compile(rb'\w+|\W')
+        self.word_loss_dict = collections.defaultdict(lambda: (0, 0))
+        self.word_emas = collections.defaultdict(lambda: MeanAndDriftEstimator())
+
     def update_lr(self, lr, layer_idx=None):
         for idx, group in enumerate(self.optimizer.param_groups):
             if (layer_idx is None) or (idx == layer_idx):
                 group['lr'] = lr
     
-    def append_layer(self, **optim_args):
-        params = self.model.append_layer()
+    def insert_layer(self, index, **optim_args):
+        params = self.model.insert_layer(index=index)
         self.optimizer.add_param_group({'params': params, **optim_args})
-        self.loss_by_layer = [np.concatenate((x, [x[-1]])) for x in self.loss_by_layer]
+        self.loss_by_layer = [np.concatenate((x[:index], [x[index], x[index]], x[index+1:])) for x in self.loss_by_layer]
 
+    def append_layer(self, **optim_args):
+        self.insert_layer(index=self.model.n_layers)
 
     def prepend_layer(self, **optim_args):
-        params = self.model.prepend_layer()
-        self.optimizer.add_param_group({'params': params, **optim_args})
-        self.loss_by_layer = [np.concatenate(([x[0]], x)) for x in self.loss_by_layer]
+        self.insert_layer(index=0)
 
     def save(self, path):
         checkpoint = {
@@ -81,7 +111,8 @@ class Trainer:
             'last_layer_loss': self.last_layer_loss,
             'times': self.times,
             'n': self.n,
-            'D': self.D
+            'D': self.D,
+            'word_loss_dict': list(self.word_loss_dict.items())
         }
         torch.save(checkpoint, path)
 
@@ -96,6 +127,11 @@ class Trainer:
         trainer.times = checkpoint['times']
         trainer.n = checkpoint['n']
         trainer.D = checkpoint['D']
+        try:
+            for (k,v) in checkpoint['word_loss_dict']:
+                trainer.word_loss_dict[k] = v
+        except:
+            pass
         trainer.time_repair()
         return trainer
 
@@ -194,14 +230,28 @@ class Trainer:
         self.optimizer.zero_grad()
         
         # compute stats
-        batch_loss_by_layer = np.mean(losses.detach().cpu().numpy(), axis=(1,2)) # over bs and pos
-        batch_last_layer_loss_by_pos = np.mean(losses[-1].detach().cpu().numpy(), axis=0) # over bs
+        batch = batch.cpu().numpy()
+        losses = losses.detach().cpu().numpy()
+        batch_loss_by_layer = np.mean(losses, axis=(1,2)) # over bs and pos
+        batch_last_layer_loss_by_pos = np.mean(losses[-1], axis=0) # over bs
         batch_last_layer_loss = np.mean(batch_last_layer_loss_by_pos)
-        
+
+        T = time.time()
+        for idx in range(losses.shape[1]):
+            example_losses = losses[-1,idx,:]
+            example = bytes(batch[idx].tolist())
+            matches = self.pattern.finditer(example)
+            for match in matches:
+                start, end = match.span()
+                element = match.group()
+                # snazzier way of doing the same we did before with the word_loss_dict
+                n, v = self.word_loss_dict[element]
+                self.word_loss_dict[element] = (n+1, v+example_losses[start:end])
+                self.word_emas[element](sum(example_losses[start:end]), T)
         # save data
         self.loss_by_layer.append(batch_loss_by_layer)
         self.last_layer_loss.append(batch_last_layer_loss)
-        self.times.append(time.time())
+        self.times.append(T)
         self.n += 1
         self.D += batch_size * example_length
 
