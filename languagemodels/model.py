@@ -305,13 +305,15 @@ class LanguageModel(Module):
     def prepend_layer(self):
         return self.insert_layer(index=0)
 
-    def forward(self, input_ids):
+    def forward(self, input_ids, depth=None):
         """
         Note: adds 1 to length, as it inserts a 0th column for bos token
         """
+        if depth is None:
+            depth = self.n_layers
         x = self.text_input(input_ids)
         xs = [x]
-        for layer in self.layers:
+        for layer in self.layers[:depth]:
             if self.checkpointing:
                 x = checkpoint(layer, x)
             else:
@@ -323,11 +325,7 @@ class LanguageModel(Module):
     
     @torch.no_grad()
     def generate(self, input_ids=None, generation_data=None, output_layer=-1, temp=1.0):
-        ## TODO: maybe this all folds into forward in a way that makes code much smaller.
-        ##       for now, keep it long and stupid, for debugging.
-        ## todo: output_layer lower could give faster inference with some changes
-        ## todo: batched version  (maybe works?)
-        ## todo: fix DRY issues
+        ## TODO: optimize
         if input_ids is None:
             device = next(self.parameters()).device
             input_ids = torch.tensor([], torch.long).to(device).view(1,0)
@@ -337,7 +335,11 @@ class LanguageModel(Module):
         x = self.text_input(input_ids)
 
         if self.n_layers > 0:
-            x = x[...,len(generation_data[0]):,:]
+            try:
+                n = generation_data[0][0].shape[-2]
+            except:
+                n = 0
+            x = x[...,n:,:]
             xs = [x]
             for layer, layer_data in zip(self.layers, generation_data):
                 x = layer(x, layer_data=layer_data)
@@ -354,9 +356,9 @@ class LanguageModel(Module):
         return torch.cat((input_ids, y), dim=-1), generation_data
 
 
-    def losses(self, output_ids):
+    def losses(self, output_ids, depth=None):
         input_ids = output_ids[...,:-1]
-        probs = self.forward(input_ids) # (n_layers+1, batch_size, example_length, n_vocab_out)
+        probs = self.forward(input_ids, depth=depth) # (n_layers+1, batch_size, example_length, n_vocab_out)
         output_ids = torch.stack([output_ids] * probs.shape[0]).unsqueeze(-1) # (n_layers+1, batch_size, example_length, 1) uint8_t data (torch.long storage)
         return -torch.gather(probs, dim=-1, index=output_ids).squeeze(-1).log2() # cross entropy samples
 
@@ -383,9 +385,10 @@ class LanguageModel(Module):
                      temp=1.0,
                      n_generate=512,
                      n_ctx=None,
-                     encoder = utf8encode,
-                     decoder = utf8decode,
-                     output_layer=-1):
+                     encoder=utf8encode,
+                     decoder=utf8decode,
+                     output_layer=-1,
+                     burst=64):
         Categorical = torch.distributions.Categorical
         if prompt is None:
             prompt = """In a shocking finding, scientists discovered a herd of unicorns living in a
@@ -400,7 +403,7 @@ English."""
         async def sampler(input_ids):            
             generation_data = [[] for _ in range(self.n_layers)]
             for idx in range(n_generate):
-                if idx % 16 == 0:
+                if burst > 0 and idx % burst == burst-1:
                     await asyncio.sleep(0)  # Give other tasks a chance to run
                 input_ids, generation_data = self.generate(input_ids=input_ids, generation_data=generation_data, output_layer=output_layer, temp=temp)
                 if n_ctx is not None:
@@ -415,12 +418,13 @@ English."""
                      n_ctx=None,
                      temp=1.0,
                      n_generate=512,
-                     encoder = utf8encode,
-                     decoder = utf8decode,
+                     encoder=utf8encode,
+                     decoder=utf8decode,
+                     burst=64,
                      output_layer=-1):
         
         sampler = self.autocomplete(prompt=prompt, temp=temp, n_generate=n_generate, n_ctx=n_ctx,
-                                    encoder=encoder, decoder=decoder, output_layer=output_layer)
+                                    encoder=encoder, decoder=decoder, output_layer=output_layer, burst=burst)
         display_handle = display(HTML(prompt), display_id=True)
         list_of_tokens = []
         async for input_ids in sampler:

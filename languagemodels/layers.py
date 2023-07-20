@@ -32,19 +32,28 @@ class TransformerLayer(Module):
         self.sdp = sdp
 
     def forward(self, x, layer_data=None):
-        (Q, Kf, Vf) = map(self.split_heads,(self.query_proj(x),self.key_proj(x),self.value_proj(x)))
+        is_causal = True
         if layer_data is None:
-            K = Kf
-            V = Vf
+            (Q, K, V) = map(self.split_heads,(self.query_proj(x),self.key_proj(x),self.value_proj(x)))
         else:
-            Ks = torch.split(Kf, 1, dim=-2)
-            Vs = torch.split(Vf, 1, dim=-2)
-            layer_data.extend(zip(Ks, Vs))
-            K = torch.cat([KV[0] for KV in layer_data], dim=-2)
-            V = torch.cat([KV[1] for KV in layer_data], dim=-2)
+            # in this mode, layer_data has (K, V), and x has suffix for which we haven't made predictions yet
+            if len(layer_data) == 2:
+                is_causal = False
+                (Ki, Vi) = layer_data
+                (Q, Kf, Vf) = map(self.split_heads,(self.query_proj(x),self.key_proj(x),self.value_proj(x)))
+                K = torch.cat([Ki, Kf], dim=-2)
+                V = torch.cat([Vi, Vf], dim=-2)
+                layer_data[0] = K
+                layer_data[1] = V
+            elif len(layer_data) == 0:
+                (Q, K, V) = map(self.split_heads,(self.query_proj(x),self.key_proj(x),self.value_proj(x)))
+                layer_data.append(K)
+                layer_data.append(V)
+            else:
+                raise ValueError(f"layer_data corrupt: {layer_data}")
 
         if self.sdp:
-            attn = torch.nn.functional.scaled_dot_product_attention(query=Q, key=K, value=V, attn_mask=None, dropout_p=0.0, is_causal=True)
+            attn = torch.nn.functional.scaled_dot_product_attention(query=Q, key=K, value=V, attn_mask=None, dropout_p=0.0, is_causal=is_causal)
         else:
             device = x.device
             n_ctx = x.shape[-2]
