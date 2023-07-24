@@ -13,7 +13,8 @@ $ mkdir data
 $ cd data
 $ wget https://the-eye.eu/public/AI/pile/train/01.jsonl.zst # takes a while
 $ zstd -d 01.jsonl.zst
-$ python3 preparedata.py
+$ python3 ../preparedata.py
+$ cd ..
 $ jupyter notebook
 ```
 
