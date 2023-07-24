@@ -91,9 +91,11 @@ def utf8bitsdecode(bits):
 
 
 class FastPileBytesDataset:
-    def __init__(self, example_length=512, paths=None, device='cuda'):
+    def __init__(self, example_length=512, prefix=None, paths=None, device='cuda'):
+        if prefix is None:
+            prefix = "./data"
         if paths is None:
-            paths = [f"/data/thepile/00.{i}.utf8" for i in range(10)]
+            paths = [f"{prefix}/00.{i}.utf8" for i in range(10)]
         self.paths = paths
         self.device = device
         self.decode = utf8decode
