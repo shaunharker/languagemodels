@@ -53,6 +53,9 @@ class Trainer:
         self.inbox = []
 
 
+    def update_dataset(self, prefix=None, example_length=None):
+        self.dataset = FastPileBytesDataset(prefix=prefix, example_length=example_length)
+
     def update_lr(self, lr, layer_idx=None):
         for idx, group in enumerate(self.optimizer.param_groups):
             if (layer_idx is None) or (idx == layer_idx):

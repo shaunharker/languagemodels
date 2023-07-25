@@ -1,8 +1,8 @@
 import os
 import json
 
-filename = '01.jsonl'
-output_filename_prefix = '01'
+filename = '00.jsonl'
+output_filename_prefix = '00'
 output_filename_suffix = '.utf8'
 output_filename_index = 0
 output_file = None
