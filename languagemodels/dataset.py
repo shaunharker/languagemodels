@@ -131,3 +131,48 @@ class FastPileBytesDataset:
 # Unused bytes in utf-8 encodings:
 # [0, 2, 4, 5, 6, 11, 14, 15, 20, 21, 22, 23, 26, 27, 28, 29, 30, 31, 127, 192, 193, 222, 223, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255]
 # """
+
+class FastPileBitsDataset:
+    def __init__(self, example_length=512, prefix=None, paths=None, device='cuda'):
+        if prefix is None:
+            prefix = "./data"
+        if paths is None:
+            paths = [f"{prefix}/00.{i}.utf8" for i in range(10)]
+        self.paths = paths
+        self.device = device
+        self.decode = utf8bitsdecode
+        self.encode = utf8bitsencode
+        self.idx = 0
+        self.path_idx = 0
+        self.example_length = example_length
+        self.load_from_dataset()
+
+    def load_from_dataset(self):
+        example_length = self.example_length
+        data = np.fromfile(self.paths[self.path_idx], dtype=np.uint8)
+        example_bytes = example_length//8
+        data = data[:(len(data)//example_bytes) * example_bytes]
+        n_examples = len(data)//example_bytes
+        print(len(data), n_examples, example_length)
+        data = data.reshape((n_examples, example_bytes))
+        np.random.shuffle(data)
+        self.data = data
+        self.path_idx += 1
+        if self.path_idx == len(self.paths):
+            self.path_idx = 0
+        self.idx = 0
+
+    def batch(self, batch_size, example_length):
+        if example_length > self.example_length:
+            raise ValueError(f"example_length of {example_length} is unsupported for this instance of FastPileBytesDataset, reconstruct")
+        if self.idx + batch_size > len(self.data):
+            self.load_from_dataset()
+        batch_data = []
+        for b_idx in range(batch_size):
+            bits = self.encode(utf8decode(self.data[self.idx:self.idx+batch_size][b_idx].tolist()))
+            if len(bits) < example_length:
+                bits = [0]*(example_length - len(bits)) + bits
+            batch_data.append(bits[:example_length])
+        result = torch.tensor(batch_data).long().to('cuda')
+        self.idx += batch_size
+        return result

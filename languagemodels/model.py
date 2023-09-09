@@ -188,6 +188,7 @@ class LanguageModel(Module):
                  layer_config=None,
                  layer_classname=None,
                  layer_classcode=None,
+                 tied_layers=False,
                  checkpointing=False):
         super().__init__()
         self.n_vocab_in = n_vocab_in
@@ -195,6 +196,7 @@ class LanguageModel(Module):
         self.bos = bos
         self.d_model = d_model
         self.n_layers = n_layers
+        self.tied_layers = tied_layers
         self.checkpointing = checkpointing
 
         def load_class(code, classname):
@@ -278,7 +280,10 @@ class LanguageModel(Module):
         self.layer_config = layer_config if layer_config is not None else {}
         
         self.text_input = input_class(**self.input_config)
-        self.layers = ModuleList(layer_class(**self.layer_config) for _ in range(self.n_layers))
+        if tied_layers:
+            self.layer = layer_class(**self.layer_config) 
+        else:
+            self.layers = ModuleList(layer_class(**self.layer_config) for _ in range(self.n_layers))
         self.text_output = output_class(**self.output_config)
 
     @property
@@ -313,16 +318,35 @@ class LanguageModel(Module):
             depth = self.n_layers
         x = self.text_input(input_ids)
         xs = [x]
-        for layer in self.layers[:depth]:
-            if self.checkpointing:
-                x = checkpoint(layer, x)
-            else:
-                x = layer(x)
-            xs.append(x)
+        if self.tied_layers:
+            for _ in range(depth):
+                if self.checkpointing:
+                    x = checkpoint(self.layer, x)
+                else:
+                    x = self.layer(x)
+                xs.append(x)
+        else:
+            for layer in self.layers[:depth]:
+                if self.checkpointing:
+                    x = checkpoint(layer, x)
+                else:
+                    x = layer(x)
+                xs.append(x)
         xs = torch.stack(xs, dim=0)
         probs = self.text_output(xs) # (n_layers+1, batch_size, example_length, n_vocab_out)
         return probs
     
+    def losses(self, output_ids, depth=None, tracking=0.0):
+        input_ids = output_ids[...,:-1]
+        probs = self.forward(input_ids, depth=depth) # (n_layers+1, batch_size, example_length, n_vocab_out)
+        output_ids = torch.stack([output_ids] * probs.shape[0]).unsqueeze(-1) # (n_layers+1, batch_size, example_length, 1) uint8_t data (torch.long storage)
+        cross_entropy = -torch.gather(probs, dim=-1, index=output_ids).squeeze(-1).log2() # cross entropy samples
+        if tracking > 0.0:
+            p = probs[1:].detach()
+            q = probs[:-1] # model prob
+            cross_entropy[:-1] = (1-tracking)*cross_entropy[:-1] - tracking*torch.sum(p * q.log2(), dim=-1)
+        return cross_entropy
+
     @torch.no_grad()
     def generate(self, input_ids=None, generation_data=None, output_layer=-1, temp=1.0):
         ## TODO: optimize
@@ -341,11 +365,16 @@ class LanguageModel(Module):
                 n = 0
             x = x[...,n:,:]
             xs = [x]
-            for layer, layer_data in zip(self.layers, generation_data):
-                x = layer(x, layer_data=layer_data)
-                xs.append(x)
-            xs = torch.stack(xs, dim=0)
-            probs = self.text_output(xs)[output_layer,:,-1,:] # (n_layers+1, batch_size, example_length, n_vocab_out)
+            if self.tied_layers:
+                for layer_data in generation_data:
+                    x = self.layer(x, layer_data=layer_data)
+                    xs.append(x)
+            else:
+                for layer, layer_data in zip(self.layers, generation_data):
+                    x = layer(x, layer_data=layer_data)
+                    xs.append(x)
+                #xs = torch.stack(xs, dim=0)
+            probs = self.text_output(xs[output_layer].unsqueeze(0))[0,:,-1,:] # (n_layers+1, batch_size, example_length, n_vocab_out)
         else:
             probs = self.text_output(x.unsqueeze(0))[0,:,-1,:] # (n_layers+1, batch_size, example_length, n_vocab_out)
 
@@ -356,11 +385,6 @@ class LanguageModel(Module):
         return torch.cat((input_ids, y), dim=-1), generation_data
 
 
-    def losses(self, output_ids, depth=None):
-        input_ids = output_ids[...,:-1]
-        probs = self.forward(input_ids, depth=depth) # (n_layers+1, batch_size, example_length, n_vocab_out)
-        output_ids = torch.stack([output_ids] * probs.shape[0]).unsqueeze(-1) # (n_layers+1, batch_size, example_length, 1) uint8_t data (torch.long storage)
-        return -torch.gather(probs, dim=-1, index=output_ids).squeeze(-1).log2() # cross entropy samples
 
     def serialize(self):
         return {'state_dict': self.state_dict(),
@@ -427,9 +451,13 @@ English."""
                                     encoder=encoder, decoder=decoder, output_layer=output_layer, burst=burst)
         display_handle = display(HTML(prompt), display_id=True)
         list_of_tokens = []
+        cnt = 0
         async for input_ids in sampler:
             c = input_ids.view(-1)[-1]
             list_of_tokens.append(c)
+            cnt += 1
+            if cnt % 8 == 0:
+                continue
             completion = decoder(list_of_tokens)
             n_lines = prompt.count("\n") + completion.count("\n")
             def cleanup(s):

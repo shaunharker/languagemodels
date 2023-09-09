@@ -45,11 +45,18 @@ class Trainer:
 
         self.dataset = FastPileBytesDataset(prefix=prefix, example_length=example_length)
         self.model = model.to('cuda')
-        self.optimizer = CustomAdamW(
-            [{'params': layer.parameters()} for layer in self.model.layers] +
-            [{'params': self.model.text_input.parameters()}] +
-            [{'params': [p]} for p in self.model.text_output.parameters()],
-            lr=self.config['lr'], betas=self.config['betas'], weight_decay=self.config['weight_decay'], batch_multiplier=self.config['batch_multiplier'])
+        if self.model.tied_layers:
+            self.optimizer = CustomAdamW(
+                [{'params': self.model.layer.parameters()}] +
+                [{'params': self.model.text_input.parameters()}] +
+                [{'params': [p]} for p in self.model.text_output.parameters()],
+                lr=self.config['lr'], betas=self.config['betas'], weight_decay=self.config['weight_decay'], batch_multiplier=self.config['batch_multiplier'])
+        else:
+            self.optimizer = CustomAdamW(
+                [{'params': layer.parameters()} for layer in self.model.layers] +
+                [{'params': self.model.text_input.parameters()}] +
+                [{'params': [p]} for p in self.model.text_output.parameters()],
+                lr=self.config['lr'], betas=self.config['betas'], weight_decay=self.config['weight_decay'], batch_multiplier=self.config['batch_multiplier'])
         self.inbox = []
 
 
@@ -97,7 +104,7 @@ class Trainer:
             batch = self.dataset.batch(batch_size=batch_size, example_length=example_length)
         return batch
             
-    def train(self, depth=None):
+    def train(self, depth=None, tracking=0.0):
         # read config
         if depth is None:
             depth = self.model.n_layers
@@ -109,7 +116,7 @@ class Trainer:
         
         # perform forward pass
 
-        losses = self.model.losses(batch, depth=depth)
+        losses = self.model.losses(batch, depth=depth, tracking=tracking)
         losses = torch.nan_to_num(losses, nan=0.0, posinf=0.0, neginf=0.0)
         loss = torch.mean(losses)
 
