@@ -61,8 +61,7 @@ class CustomAdamW(Optimizer):
                 g = torch.nan_to_num(p.grad.data, nan=0.0, posinf=0.0, neginf=0.0)
                 G = state['G'](g)
                 G2 = state['G2'](torch.square(g))
-                if self.n % group['batch_multiplier'] == 0:
-                    dp = G/torch.sqrt(G2)
-                    dp.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0).add_(p.data, alpha=group["weight_decay"])
-                    p.data.sub_(dp, alpha=group["lr"])
+                dp = G/torch.sqrt(G2)
+                dp.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0).add_(p.data, alpha=group["weight_decay"])
+                p.data.sub_(dp, alpha=group["lr"])
         

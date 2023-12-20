@@ -20,6 +20,7 @@ class Trainer:
     def __init__(self,
                  example_length=512,
                  batch_size=1,
+                 dataset=None,
                  model=None,
                  lr=1e-6,
                  betas=(.9, .999),
@@ -43,20 +44,16 @@ class Trainer:
             'batch_multiplier': batch_multiplier
         }
 
-        self.dataset = FastPileBytesDataset(prefix=prefix, example_length=example_length)
-        self.model = model.to('cuda')
-        if self.model.tied_layers:
-            self.optimizer = CustomAdamW(
-                [{'params': self.model.layer.parameters()}] +
-                [{'params': self.model.text_input.parameters()}] +
-                [{'params': [p]} for p in self.model.text_output.parameters()],
-                lr=self.config['lr'], betas=self.config['betas'], weight_decay=self.config['weight_decay'], batch_multiplier=self.config['batch_multiplier'])
+        if dataset is None:
+            self.dataset = FastPileBytesDataset(prefix=prefix, example_length=example_length)
         else:
-            self.optimizer = CustomAdamW(
-                [{'params': layer.parameters()} for layer in self.model.layers] +
-                [{'params': self.model.text_input.parameters()}] +
-                [{'params': [p]} for p in self.model.text_output.parameters()],
-                lr=self.config['lr'], betas=self.config['betas'], weight_decay=self.config['weight_decay'], batch_multiplier=self.config['batch_multiplier'])
+            self.dataset = dataset
+        self.model = model.to('cuda')
+        self.optimizer = CustomAdamW(
+            [{'params': layer.parameters()} for layer in self.model.layers] +
+            [{'params': self.model.text_input.parameters()}] +
+            [{'params': [p]} for p in self.model.text_output.parameters()],
+            lr=self.config['lr'], betas=self.config['betas'], weight_decay=self.config['weight_decay'], batch_multiplier=self.config['batch_multiplier'])
         self.inbox = []
 
 
@@ -99,12 +96,12 @@ class Trainer:
         if example_length is None:
             example_length = self.config['example_length']        
         if len(self.inbox) > 0:
-            batch = self.inbox.pop()
+            batch = self.inbox.pop().to('cuda')
         else:
             batch = self.dataset.batch(batch_size=batch_size, example_length=example_length)
         return batch
             
-    def train(self, depth=None, tracking=0.0):
+    def train(self, depth=None, tracking=0.0, update=True):
         # read config
         if depth is None:
             depth = self.model.n_layers
@@ -122,8 +119,9 @@ class Trainer:
 
         # perform optimization
         loss.backward()
-        self.optimizer.step()
-        self.optimizer.zero_grad()
+        if update:
+            self.optimizer.step()
+            self.optimizer.zero_grad()
         
         # compute stats
         batch = batch.cpu().numpy()

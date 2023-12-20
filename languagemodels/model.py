@@ -10,6 +10,8 @@ import inspect
 from IPython.display import display, HTML
 import asyncio
 from torch.utils.checkpoint import checkpoint
+import random
+from pathlib import Path
 
 class TextInput(Module):
     def __init__(self, n_vocab_in, d_model, bos=0, **kwargs):
@@ -188,7 +190,7 @@ class LanguageModel(Module):
                  layer_config=None,
                  layer_classname=None,
                  layer_classcode=None,
-                 tied_layers=False,
+                 random_layers=False,
                  checkpointing=False):
         super().__init__()
         self.n_vocab_in = n_vocab_in
@@ -196,7 +198,8 @@ class LanguageModel(Module):
         self.bos = bos
         self.d_model = d_model
         self.n_layers = n_layers
-        self.tied_layers = tied_layers
+        self.random_layers = random_layers  # shuffle layers each forward pass
+        self.depth_limit = n_layers
         self.checkpointing = checkpointing
 
         def load_class(code, classname):
@@ -280,10 +283,7 @@ class LanguageModel(Module):
         self.layer_config = layer_config if layer_config is not None else {}
         
         self.text_input = input_class(**self.input_config)
-        if tied_layers:
-            self.layer = layer_class(**self.layer_config) 
-        else:
-            self.layers = ModuleList(layer_class(**self.layer_config) for _ in range(self.n_layers))
+        self.layers = ModuleList(layer_class(**self.layer_config) for _ in range(self.n_layers))
         self.text_output = output_class(**self.output_config)
 
     @property
@@ -310,6 +310,21 @@ class LanguageModel(Module):
     def prepend_layer(self):
         return self.insert_layer(index=0)
 
+    def copy_layer(self, src_idx, trg_idx):
+        src = self.layers[src_idx]
+        trg = self.layers[trg_idx]
+        # Ensure that both layers are of the same type before copying
+        if type(src) != type(trg):
+            raise ValueError("Source and target layers must be of the same type to copy parameters")
+        # Copy parameters from src to trg
+        trg.load_state_dict(src.state_dict())
+
+    def double_layers(self):
+        n = self.n_layers
+        for idx in range(n):
+            self.prepend_layer()
+            self.copy_layer(n, 0)
+
     def forward(self, input_ids, depth=None):
         """
         Note: adds 1 to length, as it inserts a 0th column for bos token
@@ -318,12 +333,19 @@ class LanguageModel(Module):
             depth = self.n_layers
         x = self.text_input(input_ids)
         xs = [x]
-        if self.tied_layers:
-            for _ in range(depth):
+
+        if self.random_layers:
+            # shuffled_list = list(range(self.n_layers))
+            # random.shuffle(shuffled_list)
+            # for idx in shuffled_list[:depth]:
+            for d in range(depth):
+                # print(f'layer {d}')
+                idx = random.randint(0, self.n_layers-1)
+                layer = self.layers[idx]
                 if self.checkpointing:
-                    x = checkpoint(self.layer, x)
+                    x = checkpoint(layer, x)
                 else:
-                    x = self.layer(x)
+                    x = layer(x)
                 xs.append(x)
         else:
             for layer in self.layers[:depth]:
@@ -342,19 +364,26 @@ class LanguageModel(Module):
         output_ids = torch.stack([output_ids] * probs.shape[0]).unsqueeze(-1) # (n_layers+1, batch_size, example_length, 1) uint8_t data (torch.long storage)
         cross_entropy = -torch.gather(probs, dim=-1, index=output_ids).squeeze(-1).log2() # cross entropy samples
         if tracking > 0.0:
-            p = probs[1:].detach()
-            q = probs[:-1] # model prob
-            cross_entropy[:-1] = (1-tracking)*cross_entropy[:-1] - tracking*torch.sum(p * q.log2(), dim=-1)
+            p = probs[-1].detach().unsqueeze(0)
+            q = probs # model prob
+            cross_entropy = cross_entropy - tracking*torch.sum(p * (q.log2() - p.log2()), dim=-1)
         return cross_entropy
 
     @torch.no_grad()
-    def generate(self, input_ids=None, generation_data=None, output_layer=-1, temp=1.0):
-        ## TODO: optimize
+    def generate(self, input_ids=None, generation_data=None, output_layer=-1, temp=1.0, pattern=None):
+        ## pattern -- if not None, gives the pattern of layers to call in order.
         if input_ids is None:
             device = next(self.parameters()).device
             input_ids = torch.tensor([], torch.long).to(device).view(1,0)
+
+        if pattern is None:
+            pattern = list(range(self.n_layers))
+        
         if generation_data is None:
-            generation_data = [[] for _ in range(self.n_layers)]  # not the same as [[]]*self.n_layers, which gives SAME list.
+            if pattern is None:
+                generation_data = [[] for _ in range(self.n_layers)]  # not the same as [[]]*self.n_layers, which gives SAME list.
+            else:
+                generation_data = [[] for _ in pattern]
 
         x = self.text_input(input_ids)
 
@@ -365,14 +394,10 @@ class LanguageModel(Module):
                 n = 0
             x = x[...,n:,:]
             xs = [x]
-            if self.tied_layers:
-                for layer_data in generation_data:
-                    x = self.layer(x, layer_data=layer_data)
-                    xs.append(x)
-            else:
-                for layer, layer_data in zip(self.layers, generation_data):
-                    x = layer(x, layer_data=layer_data)
-                    xs.append(x)
+            for layer_idx, layer_data in zip(pattern, generation_data):
+                layer = self.layers[layer_idx]
+                x = layer(x, layer_data=layer_data)
+                xs.append(x)
                 #xs = torch.stack(xs, dim=0)
             probs = self.text_output(xs[output_layer].unsqueeze(0))[0,:,-1,:] # (n_layers+1, batch_size, example_length, n_vocab_out)
         else:
@@ -383,8 +408,6 @@ class LanguageModel(Module):
         else:
             y = torch.argmax(probs, keepdim=True)
         return torch.cat((input_ids, y), dim=-1), generation_data
-
-
 
     def serialize(self):
         return {'state_dict': self.state_dict(),
@@ -412,6 +435,7 @@ class LanguageModel(Module):
                      encoder=utf8encode,
                      decoder=utf8decode,
                      output_layer=-1,
+                     pattern=None,
                      burst=64):
         Categorical = torch.distributions.Categorical
         if prompt is None:
@@ -423,19 +447,20 @@ English."""
         input_ids = torch.tensor([c for c in encoder(prompt)], dtype=torch.long, device=device).unsqueeze(0)
         if n_ctx is not None:
             input_ids = input_ids[...,-n_ctx:]
-        
-        async def sampler(input_ids):            
-            generation_data = [[] for _ in range(self.n_layers)]
+        if type(pattern) is int:
+            pattern = [random.randint(0, self.n_layers-1) for _ in range(pattern)]
+        async def sampler(input_ids, pattern):            
+            generation_data = None
             for idx in range(n_generate):
                 if burst > 0 and idx % burst == burst-1:
                     await asyncio.sleep(0)  # Give other tasks a chance to run
-                input_ids, generation_data = self.generate(input_ids=input_ids, generation_data=generation_data, output_layer=output_layer, temp=temp)
+                input_ids, generation_data = self.generate(input_ids=input_ids, generation_data=generation_data, output_layer=output_layer, temp=temp, pattern=pattern)
                 if n_ctx is not None:
                     input_ids = input_ids[...,-n_ctx:]
                     generation_data = [layer_data[-n_ctx:] for layer_data in generation_data] ## todo, why not use a tensor? lists of lists was premature optimization, i think
                 yield input_ids
 
-        return sampler(input_ids)
+        return sampler(input_ids, pattern)
     
     async def display_autocomplete(self,
                      prompt=None,
@@ -445,10 +470,11 @@ English."""
                      encoder=utf8encode,
                      decoder=utf8decode,
                      burst=64,
-                     output_layer=-1):
+                     output_layer=-1,
+                     pattern=None):
         
         sampler = self.autocomplete(prompt=prompt, temp=temp, n_generate=n_generate, n_ctx=n_ctx,
-                                    encoder=encoder, decoder=decoder, output_layer=output_layer, burst=burst)
+                                    encoder=encoder, decoder=decoder, output_layer=output_layer, burst=burst, pattern=pattern)
         display_handle = display(HTML(prompt), display_id=True)
         list_of_tokens = []
         cnt = 0
@@ -466,3 +492,69 @@ English."""
                     '<span style="color: white">' + cleanup(prompt) + '</span>' + cleanup(completion) + '\n'*max(1, 20-n_lines) + '</pre>')
             display_handle.update(HTML(contents))
         return display_handle
+
+
+    def save(self, path):
+        checkpoint = {
+            'model': self.serialize(),
+        }
+        torch.save(checkpoint, path)
+
+    @classmethod
+    def load(cls, path):
+        checkpoint = torch.load(path)
+        model = LanguageModel(**checkpoint['model']['config'])
+        model.load_state_dict(checkpoint['model']['state_dict'])
+        return model
+
+    def save_version(self, path, max_versions=4):
+        # Get the base path without the extension
+        base_path = Path(path).with_suffix('')
+
+        # Get all existing versions
+        existing_versions = [
+            p for p in base_path.parent.glob(f"{base_path.name}-*") if p.is_file()
+        ]
+
+        # If there are max_versions or more, delete the oldest one
+        if len(existing_versions) >= max_versions:
+            oldest_version = min(existing_versions, key=os.path.getctime)
+            os.remove(oldest_version)
+
+        # Find the highest current version number
+        if existing_versions:
+            max_version = max(int(p.stem.split('-')[-1]) for p in existing_versions)
+        else:
+            max_version = -1
+
+        # Use the next version number for the new save
+        new_version = max_version + 1
+
+        # Create new versioned file name
+        new_path = f"{base_path}-{new_version}.pt"
+        
+        # Save to the new path
+        self.save(new_path)
+    
+    @classmethod
+    def load_version(cls, path):
+        # Get the base path without the extension
+        base_path = Path(path).with_suffix('')
+
+        # Get all existing versions
+        existing_versions = [
+            p for p in base_path.parent.glob(f"{base_path.name}-*") if p.is_file()
+        ]
+
+        # If there are no versions, raise an exception
+        if not existing_versions:
+            raise ValueError(f"No versions of {path} found")
+
+        # Find the highest current version number
+        max_version = max(int(p.stem.split('-')[-1]) for p in existing_versions)
+
+        # Construct path to most recent version
+        recent_path = f"{base_path}-{max_version}.pt"
+
+        # Load the mything from the most recent path
+        return cls.load(path=recent_path)
