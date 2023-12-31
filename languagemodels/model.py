@@ -369,14 +369,36 @@ class LanguageModel(Module):
             cross_entropy = cross_entropy - tracking*torch.sum(p * (q.log2() - p.log2()), dim=-1)
         return cross_entropy
 
-    def train(self, batch, lr=1e-8, beta=0.99, mu=1e-7):
+    # def train(self, batch, lr=1e-8, beta=0.99, mu=1e-7):
+    #     if type(batch) is str:
+    #         batch = bytes(txt[idx:idx+example_length], encoding='utf8')
+    #     if type(batch) is bytes:
+    #         batch = torch.tensor(list(batch)).long().view(1, -1).to('cuda')
+    #     losses = self.losses(batch)
+    #     losses = torch.nan_to_num(losses, nan=0.0, posinf=0.0, neginf=0.0)
+    #     loss = torch.mean(losses)
+    #     loss.backward()        
+    #     for name, p in self.named_parameters():
+    #         p.data.mul_(1.0 - mu * torch.sign(p.grad) * torch.sign(p.data))
+    #         p.data.sub_(torch.sign(p.grad), alpha=lr)
+    #         p.grad.data *= beta
+    #     return losses.detach().cpu().numpy()
+
+    def train(self, batch, mask=None, scale=1.0, lr=1e-8, beta=0.99, mu=1e-7):
         if type(batch) is str:
-            batch = bytes(txt[idx:idx+example_length], encoding='utf8')
+            batch = bytes(txt, encoding='utf8')
         if type(batch) is bytes:
             batch = torch.tensor(list(batch)).long().view(1, -1).to('cuda')
         losses = self.losses(batch)
         losses = torch.nan_to_num(losses, nan=0.0, posinf=0.0, neginf=0.0)
-        loss = torch.mean(losses)
+        if mask is None:
+            mask = 1
+            ratio = 1
+        else:
+            mask = torch(mask).to('cuda').view(1, 1, -1)
+            ratio = torch.sum(mask)/torch.numel(mask)
+        losses = losses * mask
+        loss = scale*torch.mean(losses)/ratio
         loss.backward()        
         for name, p in self.named_parameters():
             p.data.mul_(1.0 - mu * torch.sign(p.grad) * torch.sign(p.data))
@@ -384,9 +406,10 @@ class LanguageModel(Module):
             p.grad.data *= beta
         return losses.detach().cpu().numpy()
 
+
     def test(self, batch):
         if type(batch) is str:
-            batch = bytes(txt[idx:idx+example_length], encoding='utf8')
+            batch = bytes(txt, encoding='utf8')
         if type(batch) is bytes:
             batch = torch.tensor(list(batch)).long().view(1, -1).to('cuda')
         with torch.no_grad():
@@ -497,19 +520,28 @@ English."""
                      decoder=utf8decode,
                      burst=64,
                      output_layer=-1,
-                     pattern=None):
+                     pattern=None,
+                     stopwords=[]):
         
         sampler = self.autocomplete(prompt=prompt, temp=temp, n_generate=n_generate, n_ctx=n_ctx,
                                     encoder=encoder, decoder=decoder, output_layer=output_layer, burst=burst, pattern=pattern)
         display_handle = display(HTML(prompt), display_id=True)
         list_of_tokens = []
-        cnt = 0
         async for input_ids in sampler:
-            c = input_ids.view(-1)[-1]
-            list_of_tokens.append(c)
-            cnt += 1
-            if cnt % 8 == 0:
-                continue
+            # input_ids is shifted with new sampled token each iteration
+            new_token = input_ids.view(-1)[-1]
+            list_of_tokens.append(new_token)
+
+            stopworddetected = False
+            for word in stopwords:
+                if type(word) is str:
+                    word = bytes(word, encoding='utf8')
+                if bytes(list_of_tokens[-len(word):]) == word:
+                    stopworddetected = True
+                    break
+            if stopworddetected:
+                break 
+            
             completion = decoder(list_of_tokens)
             n_lines = prompt.count("\n") + completion.count("\n")
             def cleanup(s):
@@ -584,3 +616,136 @@ English."""
 
         # Load the mything from the most recent path
         return cls.load(path=recent_path)
+
+
+import os
+import json
+import numpy as np
+import bisect
+import weakref
+
+class VirtualConcatenation:
+    def __init__(self, line_reader):
+        self.line_reader = weakref.ref(line_reader)
+
+    def __len__(self):
+        # Return the total length of the concatenated text
+        return int(self.line_reader().cumulative_lengths[-1])
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            # Handle negative index
+            if key < 0:
+                key += len(self)
+            if key < 0 or key >= len(self):
+                raise IndexError("Index out of range")
+
+            # Get the single character
+            return self.line_reader().get_slice_text(key, key + 1)
+        elif isinstance(key, slice):
+            # Handle slice indices
+            start, stop, step = key.indices(len(self))
+            if step != 1:
+                raise ValueError("Slicing with step is not supported")
+
+            return self.line_reader().get_slice_text(start, stop)
+        else:
+            raise TypeError("Invalid argument type")
+            
+class Reader:
+    def __init__(self, path, func=None):
+        self.path = path
+        self.lbsp_path = f"{path}.lbsp"  # Line break seek positions file
+        self.cl_path = f"{path}.cl"  # Cumulative lengths file
+        if func is None:
+            if path.endswith('.jsonl'):
+                func = lambda line: bytes(json.loads(line)['text'], encoding='utf8') + bytes([0])
+            if path.endswith('.txt'):
+                func = lambda line: bytes(line, encoding='utf8') + bytes([0])
+        self.func = func if func is not None else lambda line: line
+        self._index_line_breaks()
+        self._load_or_create_cumulative_lengths()
+        self.cat = VirtualConcatenation(self)
+
+    def _is_up_to_date(self, file_path):
+        if not os.path.exists(file_path):
+            return False
+        original_mod_time = os.path.getmtime(self.path)
+        file_mod_time = os.path.getmtime(file_path)
+        return file_mod_time >= original_mod_time
+
+    def _index_line_breaks(self):
+        if self._is_up_to_date(self.lbsp_path):
+            self.seek_positions = np.fromfile(self.lbsp_path, dtype=np.uint64)
+        else:
+            with open(self.path, 'rb') as file:
+                self.seek_positions = np.array([0] + [len(line) for line in file]).cumsum(dtype=np.uint64)
+            self.seek_positions.tofile(self.lbsp_path)
+
+    def _load_or_create_cumulative_lengths(self):
+        if self._is_up_to_date(self.cl_path):
+            self.cumulative_lengths = np.fromfile(self.cl_path, dtype=np.uint64)
+        else:
+            self.cumulative_lengths = self._calculate_cumulative_lengths()
+            self.cumulative_lengths.tofile(self.cl_path)
+
+    def _calculate_cumulative_lengths(self):
+        lengths = []
+        for i in range(len(self.seek_positions) - 1):
+            line = self._get_line(i)
+            lengths.append(len(line))
+        return np.cumsum(lengths, dtype=np.uint64)
+
+    def _get_line(self, line_idx):
+        with open(self.path, 'rb') as file:
+            file.seek(self.seek_positions[line_idx])
+            return self.func(file.readline())
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            return [self._get_line(i) for i in range(*key.indices(len(self.seek_positions) - 1))]
+        elif isinstance(key, int):
+            while key < 0:
+                key += len(self.seek_positions) - 1
+            if key >= len(self.seek_positions) - 1:
+                raise IndexError("Line index out of range")
+            return self._get_line(key)
+        else:
+            raise TypeError("Invalid argument type.")
+
+    def __len__(self):
+        return len(self.seek_positions) - 1
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self._get_line(i)
+
+    def to_contiguous_index(self, line_idx, offset_idx):
+        if line_idx > 0:
+            return int(self.cumulative_lengths[line_idx - 1]) + offset_idx
+        else:
+            return offset_idx
+
+    def to_line_offset(self, contiguous_idx):
+        while contiguous_idx < 0:
+            contiguous_idx += self.cumulative_lengths[-1]
+        line_idx = bisect.bisect_right(self.cumulative_lengths, contiguous_idx)
+        offset_idx = contiguous_idx - (int(self.cumulative_lengths[line_idx - 1]) if line_idx > 0 else 0)
+        return line_idx, offset_idx
+    
+    def get_slice_text(self, start, end):
+        """
+        Retrieve the text from the virtual concatenated file for the slice [start:end].
+        """
+        start_line_idx, start_offset = self.to_line_offset(start)
+        end_line_idx, end_offset = self.to_line_offset(end)
+
+        if start_line_idx == end_line_idx:
+            return self._get_line(start_line_idx)[start_offset:end_offset]
+
+        texts = [self._get_line(start_line_idx)[start_offset:]]
+        for line_idx in range(start_line_idx + 1, end_line_idx):
+            texts.append(self._get_line(line_idx))
+        if end_offset > 0:
+            texts.append(self._get_line(end_line_idx)[:end_offset])
+        return b''.join(texts)
