@@ -409,7 +409,7 @@ class LanguageModel(Module):
 
     def test(self, batch):
         if type(batch) is str:
-            batch = bytes(txt, encoding='utf8')
+            batch = bytes(batch, encoding='utf8')
         if type(batch) is bytes:
             batch = torch.tensor(list(batch)).long().view(1, -1).to('cuda')
         with torch.no_grad():
